@@ -26,6 +26,14 @@ export interface ResolvedModel {
 }
 
 const MODEL_LIST_KEYS = ["models", "data"] as const;
+const LUNA_MODEL_SLUG = "gpt-5.6-luna";
+const LUNA_ALIAS_PREFIX = "luna-";
+
+export function isLunaModelId(model: string): boolean {
+  return model === LUNA_MODEL_SLUG
+    || model.startsWith(`${LUNA_MODEL_SLUG}-`)
+    || model.startsWith(LUNA_ALIAS_PREFIX);
+}
 
 export function normalizeModelCatalog(value: unknown): ModelCatalogEntry[] {
   const rawModels = Array.isArray(value)
@@ -116,6 +124,24 @@ export function resolveModelAlias(
     };
   }
 
+  if (requestedModel.startsWith(LUNA_ALIAS_PREFIX)) {
+    const luna = catalog.find((entry) => entry.slug === LUNA_MODEL_SLUG);
+    const effort = requestedModel.slice(LUNA_ALIAS_PREFIX.length);
+    if (
+      luna != null
+      && effort
+      && luna.supportedReasoningLevels.some((level) => level.effort === effort)
+    ) {
+      return {
+        requestedModel,
+        upstreamModel: luna.slug,
+        reasoningEffort: effort,
+        catalogEntry: luna,
+        alias: true,
+      };
+    }
+  }
+
   return {
     requestedModel,
     upstreamModel: requestedModel,
@@ -130,6 +156,7 @@ export function publicModelsFromCatalog(
   const models: Record<string, unknown>[] = [];
   for (const entry of catalog) {
     if (entry.supportedInApi === false) continue;
+    const virtualAliases: string[] = [];
     const add = (id: string, suffix?: string): void => {
       models.push({
         id,
@@ -147,6 +174,12 @@ export function publicModelsFromCatalog(
     add(entry.slug);
     for (const level of entry.supportedReasoningLevels) {
       add(`${entry.slug}-${level.effort}`, level.effort);
+      if (entry.slug === LUNA_MODEL_SLUG) {
+        virtualAliases.push(level.effort);
+      }
+    }
+    for (const effort of virtualAliases) {
+      add(`${LUNA_ALIAS_PREFIX}${effort}`, effort);
     }
   }
   return models;

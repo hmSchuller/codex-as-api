@@ -41,6 +41,7 @@ export {
 } from "./protocol.js";
 export {
   normalizeModelCatalog,
+  isLunaModelId,
   publicModelsFromCatalog,
   resolveModelAlias,
   type ModelCatalogEntry,

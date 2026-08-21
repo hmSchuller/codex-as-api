@@ -133,9 +133,13 @@ gpt-5.6-luna-medium
 gpt-5.6-luna-high
 gpt-5.6-luna-xhigh
 gpt-5.6-luna-max
+luna-medium
+luna-high
+luna-xhigh
+luna-max
 ```
 
-The list is dynamic. The proxy creates a reasoning alias only when the upstream catalog advertises that exact effort for `gpt-5.6-luna`; it does not claim unsupported levels. `gpt-5.6-luna-high` sends `model: gpt-5.6-luna` and `reasoning.effort: high` upstream. The unsuffixed Luna model uses the catalog's advertised default effort, not a Sol-derived or globally forced value.
+The list is dynamic. The proxy creates a reasoning alias only when the upstream catalog advertises that exact effort for `gpt-5.6-luna`; it does not claim unsupported levels. Cursor may normalize the longer `gpt-5.6-luna-xhigh` ID back to `gpt-5.6-luna`, so use the short virtual IDs such as `luna-xhigh` and `luna-max` when configuring Cursor. They send `model: gpt-5.6-luna` with the matching `reasoning.effort` upstream. The unsuffixed Luna model uses the catalog's advertised default effort, not a Sol-derived or globally forced value.
 
 ### Troubleshooting and verification
 
@@ -145,7 +149,7 @@ The list is dynamic. The proxy creates a reasoning alias only when the upstream 
 - If the tunnel exits unexpectedly, check that the named tunnel token is current and that its hostname ingress points to `http://127.0.0.1:8787`.
 - If the public health check fails, verify that `PUBLIC_URL` is the Cloudflare hostname without `/v1`; Cursor receives the normalized `/v1` URL.
 - If Luna is absent from `GET /v1/models`, the authenticated account did not expose Luna in the Codex catalog. The proxy fails Luna requests clearly instead of silently switching to Sol.
-- Set `CODEX_AS_API_LOG=info` to log the incoming model, resolved upstream model, reasoning effort, upstream status, response ID, and tool names. Prompts and credentials are not logged.
+- Set `CODEX_AS_API_LOG=info` to log the incoming model, resolved upstream model, reasoning effort, upstream status, response ID, and tool names. Set it to `debug` to inspect model-related request fields and headers. Prompts and credentials are not logged.
 - Verify the request path with a model alias such as `gpt-5.6-luna-high` and check the diagnostic line for `resolved model: gpt-5.6-luna reasoning: high`.
 - Function tools are forwarded to Luna and returned to Cursor as Chat Completions tool calls. Cursor executes them; this proxy never executes tools.
 

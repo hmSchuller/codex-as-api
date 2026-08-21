@@ -89,6 +89,13 @@ describe("GPT-5.6 Luna model catalog", () => {
       alias: true,
     });
     assert.equal(resolveModelAlias("gpt-5.6-luna-max", catalog).reasoningEffort, "max");
+    assert.deepEqual(resolveModelAlias("luna-xhigh", catalog), {
+      requestedModel: "luna-xhigh",
+      upstreamModel: "gpt-5.6-luna",
+      reasoningEffort: "xhigh",
+      catalogEntry: catalog[0],
+      alias: true,
+    });
     assert.equal(resolveModelAlias("gpt-5.6-luna", catalog).upstreamModel, "gpt-5.6-luna");
     const unknown = resolveModelAlias("gpt-5.6-luna-low", catalog);
     assert.equal(unknown.upstreamModel, "gpt-5.6-luna-low");
@@ -103,6 +110,10 @@ describe("GPT-5.6 Luna model catalog", () => {
       "gpt-5.6-luna-high",
       "gpt-5.6-luna-xhigh",
       "gpt-5.6-luna-max",
+      "luna-medium",
+      "luna-high",
+      "luna-xhigh",
+      "luna-max",
     ]);
     assert.equal(models.every((model) => model.created === 123), true);
   });
@@ -165,6 +176,10 @@ describe("Cursor Luna HTTP compatibility", () => {
         "gpt-5.6-luna-high",
         "gpt-5.6-luna-xhigh",
         "gpt-5.6-luna-max",
+        "luna-medium",
+        "luna-high",
+        "luna-xhigh",
+        "luna-max",
       ]);
 
       const response = await fetch(`${baseUrl}/v1/chat/completions`, {
@@ -174,7 +189,7 @@ describe("Cursor Luna HTTP compatibility", () => {
           authorization: "Bearer luna-proxy-secret",
         },
         body: JSON.stringify({
-          model: "gpt-5.6-luna-high",
+          model: "luna-xhigh",
           messages: [
             { role: "system", content: "You are Cursor." },
             { role: "developer", content: "Preserve this developer instruction." },
@@ -184,7 +199,7 @@ describe("Cursor Luna HTTP compatibility", () => {
       });
       assert.equal(response.status, 200);
       assert.equal(seenOptions.model, "gpt-5.6-luna");
-      assert.deepEqual(seenOptions.reasoning, { effort: "high" });
+      assert.deepEqual(seenOptions.reasoning, { effort: "xhigh" });
       assert.deepEqual((seenMessages as { role: string; content: string }[]).map((message) => [message.role, message.content]), [
         ["system", "You are Cursor."],
         ["developer", "Preserve this developer instruction."],

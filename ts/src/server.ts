@@ -33,6 +33,7 @@ import {
   normalizeModelCatalog,
   publicModelsFromCatalog,
   resolveModelAlias,
+  isLunaModelId,
   type ModelCatalogEntry,
 } from "./model-catalog.js";
 import { countO200kOrdinaryTokens } from "./o200k-tokenizer.js";
@@ -202,12 +203,12 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     // Luna visibility and aliases are account-sensitive. Legacy secondary
     // model IDs retain the existing transport behavior without adding a
     // catalog round trip to every compatibility request.
-    const catalog = requestedModel.startsWith("gpt-5.6-luna")
+    const catalog = isLunaModelId(requestedModel)
       ? await catalogStore.get(true)
       : bundledCatalog();
     const resolved = resolveModelAlias(requestedModel, catalog);
     if (
-      requestedModel.startsWith("gpt-5.6-luna")
+      isLunaModelId(requestedModel)
       && resolved.catalogEntry == null
     ) {
       throw new ChatGPTOAuthError(
@@ -248,6 +249,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     async (req: Request, res: Response) => {
       try {
         const body = req.body;
+        debugModelRequest(req, body);
         rejectUnsupportedGenerationFeatures(body);
         const messages = requestMessagesToInternal(
           body.messages || [],
@@ -755,6 +757,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   app.post("/v1/messages/count_tokens", async (req: Request, res: Response) => {
     try {
       const body = stripAnthropicCacheControls(req.body);
+      debugModelRequest(req, body);
       rejectUnsupportedGenerationFeatures(body);
       validateAnthropicContextManagement(body.context_management);
       const { messages, tools } = anthropicRequestToInternal({
@@ -1771,6 +1774,49 @@ function diagnosticLog(message: string): void {
   const level = (process.env.CODEX_AS_API_LOG ?? "info").trim().toLowerCase();
   if (level === "off" || level === "silent" || level === "none") return;
   console.info(`[codex-as-api] ${message}`);
+}
+
+function debugModelRequest(req: Request, body: unknown): void {
+  const level = (process.env.CODEX_AS_API_LOG ?? "info").trim().toLowerCase();
+  if (level !== "debug" && level !== "trace") return;
+
+  const record = isRecord(body) ? body : {};
+  const bodyFields: Record<string, unknown> = {};
+  for (const name of [
+    "model",
+    "model_id",
+    "modelId",
+    "model_name",
+    "modelName",
+    "reasoning",
+    "reasoning_effort",
+    "reasoningEffort",
+    "effort",
+  ]) {
+    if (Object.hasOwn(record, name)) bodyFields[name] = debugModelValue(record[name]);
+  }
+
+  const headerFields: Record<string, string | string[] | undefined> = {};
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (/model|reason|effort/i.test(name)) headerFields[name] = value;
+  }
+
+  console.info(`[codex-as-api] model request ${JSON.stringify({
+    method: req.method,
+    path: req.originalUrl,
+    body_keys: Object.keys(record).sort(),
+    body_fields: bodyFields,
+    headers: headerFields,
+  })}`);
+}
+
+function debugModelValue(value: unknown): unknown {
+  if (value == null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) return `[array:${value.length}]`;
+  if (typeof value === "object") return "[object]";
+  return `[${typeof value}]`;
 }
 
 function proxyAuthentication(expectedKey: string | undefined) {
