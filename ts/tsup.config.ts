@@ -34,4 +34,11 @@ export default defineConfig([
     banner: { js: "#!/usr/bin/env node" },
     define: embeddedRankData,
   },
+  {
+    entry: ["src/setup.ts"],
+    format: ["esm"],
+    clean: false,
+    splitting: false,
+    define: embeddedRankData,
+  },
 ]);

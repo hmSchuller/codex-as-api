@@ -27,7 +27,26 @@ Runs a lightweight HTTP server on `localhost` that translates standard OpenAI AP
 
 Python, Rust, and TypeScript (npm) implementations are provided. Use the TypeScript or Python server for the Cursor + Luna bridge described below; Rust retains the lower-level compatibility implementation.
 
+## Personal Cursor + Luna Quick Start
+
+The supported personal workflow uses one Codex account, one local TypeScript proxy, and one remotely managed Cloudflare Tunnel:
+
+1. Run `codex login`
+2. Change into the TypeScript package: `cd ts`
+3. Install dependencies: `npm ci`
+4. Run `npm run setup`
+5. Configure the named Cloudflare Tunnel hostname to point to `http://127.0.0.1:8787`
+6. Run `npm start`
+7. Paste the printed Base URL and proxy API key into Cursor
+8. Select `gpt-5.6-luna-high`, `gpt-5.6-luna-xhigh`, or `gpt-5.6-luna-max`
+
+After setup, `npm start` launches both the local proxy and named tunnel. The normal startup checks Codex authentication, the local health endpoint, the tunnel connection, and the authenticated Luna model catalog before printing Cursor settings.
+
 ## Prerequisites
+
+The TypeScript workflow requires Node.js 18 or newer. Python development and
+CI checks use Python 3.12 by default through `PYTHON_VERSION`; the package
+metadata continues to support Python 3.10 and newer.
 
 Install the official Codex CLI and log in so that `~/.codex/auth.json` exists:
 
@@ -57,18 +76,20 @@ This proxy keeps Cursor as the agent. Cursor supplies the system prompt, develop
 
 ### Run the proxy
 
-The TypeScript server is the Cursor-focused implementation. Build it and start it with a proxy-only API key:
+The TypeScript server is the Cursor-focused implementation. For the personal workflow, configure it once and use the named Cloudflare Tunnel automatically:
 
 ```bash
 cd ts
-npm install
-npm run build
-HOST=127.0.0.1 PORT=8787 PROXY_API_KEY='<random-secret>' node dist/cli.js
+npm ci
+npm run setup
+npm start
 ```
 
-`HOST` and `PORT` are aliases for the existing `CODEX_AS_API_HOST` and `CODEX_AS_API_PORT` settings. `PROXY_API_KEY` is required by the executable and must be sent as `Authorization: Bearer <PROXY_API_KEY>` on `/v1` requests. It is not an OpenAI or ChatGPT credential.
+`npm run setup` creates a local, ignored `.env`, generates `PROXY_API_KEY` with 32 cryptographically secure random bytes, asks for `CLOUDFLARE_TUNNEL_TOKEN` and `PUBLIC_URL`, and checks Node, `cloudflared`, and Codex authentication. It does not overwrite existing non-empty values. `npm run config` prints the local Cursor configuration with the real proxy key when it is needed.
 
-Keep the server on localhost unless remote access is required. For a temporary HTTPS connection, use a tunnel such as `cloudflared tunnel --url http://127.0.0.1:8787` or put it behind an HTTPS reverse proxy that forwards only the `/v1` routes. Do not expose the process without `PROXY_API_KEY`, TLS, and access controls.
+`HOST` and `PORT` are aliases for the existing `CODEX_AS_API_HOST` and `CODEX_AS_API_PORT` settings. `PROXY_API_KEY` is sent by Cursor as `Authorization: Bearer <PROXY_API_KEY>` on `/v1` requests. It is not an OpenAI or ChatGPT credential. The tunnel token is never sent to Cursor or placed in the cloudflared command arguments.
+
+The normal command requires a named/remotely managed Cloudflare Tunnel. Do not use Quick Tunnels. The tunnel must forward the configured hostname to `http://127.0.0.1:8787`; `/health` is intentionally unauthenticated so startup can verify the route, while `/v1` still requires `PROXY_API_KEY`.
 
 ### Configure Cursor
 
@@ -78,6 +99,31 @@ Set Cursor's OpenAI-compatible provider to:
 Base URL: https://<proxy-host>/v1
 API key: <PROXY_API_KEY>
 ```
+
+For local-only debugging, use `npm run local`. It starts the proxy without cloudflared and uses `http://127.0.0.1:8787/v1`.
+
+### Named Cloudflare Tunnel
+
+Install `cloudflared` separately; setup does not install privileged system packages. On macOS:
+
+```bash
+brew install cloudflared
+```
+
+Create or use one remotely managed named tunnel in Cloudflare. Configure its public hostname ingress to the local service:
+
+```text
+Hostname: luna.example.com
+Service:  http://127.0.0.1:8787
+```
+
+Copy that tunnel's token into `npm run setup` when prompted. The application starts it with the equivalent of:
+
+```bash
+TUNNEL_TOKEN=<token-from-environment> cloudflared tunnel --no-autoupdate run
+```
+
+The actual token is passed through the child process environment and never appears in the command arguments. Long-lived SSE responses use the named tunnel route; no Quick Tunnel or alternate provider is involved.
 
 Use `GET /v1/models` to see the model IDs currently exposed by the authenticated Codex account. Add the Luna IDs returned there as Cursor custom models. A typical Luna catalog is:
 
@@ -94,6 +140,10 @@ The list is dynamic. The proxy creates a reasoning alias only when the upstream 
 ### Troubleshooting and verification
 
 - `401` from the proxy means the Cursor API key is missing or incorrect. OAuth errors after that point refer to `~/.codex/auth.json` or its refresh token.
+- If startup says Codex authentication is missing, run `codex login` and then `npm start`.
+- If startup says `cloudflared` is missing, install it and rerun `npm start`; setup prints the platform-specific installation instruction.
+- If the tunnel exits unexpectedly, check that the named tunnel token is current and that its hostname ingress points to `http://127.0.0.1:8787`.
+- If the public health check fails, verify that `PUBLIC_URL` is the Cloudflare hostname without `/v1`; Cursor receives the normalized `/v1` URL.
 - If Luna is absent from `GET /v1/models`, the authenticated account did not expose Luna in the Codex catalog. The proxy fails Luna requests clearly instead of silently switching to Sol.
 - Set `CODEX_AS_API_LOG=info` to log the incoming model, resolved upstream model, reasoning effort, upstream status, response ID, and tool names. Prompts and credentials are not logged.
 - Verify the request path with a model alias such as `gpt-5.6-luna-high` and check the diagnostic line for `resolved model: gpt-5.6-luna reasoning: high`.
@@ -191,6 +241,8 @@ Environment variables (Python, Rust, and TypeScript):
 | `HOST` / `CODEX_AS_API_HOST` | `127.0.0.1` | Bind address |
 | `PORT` / `CODEX_AS_API_PORT` | `8787` | Listen port |
 | `PROXY_API_KEY` | required by Python and TypeScript executables | Bearer secret required by `/v1` |
+| `CLOUDFLARE_TUNNEL_TOKEN` | required by `npm start` | Token for the one named Cloudflare Tunnel; passed to cloudflared as `TUNNEL_TOKEN` |
+| `PUBLIC_URL` | required by `npm start` | External Cloudflare hostname, such as `https://luna.example.com` |
 | `CODEX_AS_API_MODEL` | `gpt-5.6-luna` in Python/TypeScript; Rust keeps its existing Codex-config fallback | Explicit proxy model override |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
 | `CODEX_AS_API_CODEX_CLI_VERSION` | `0.147.0` | Override the validated Codex compatibility baseline identified in backend request `User-Agent` headers |
@@ -199,6 +251,15 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_MODEL_CATALOG_TTL_MS` | `300000` | Cache duration for the authenticated Codex model catalog |
 | `CODEX_AS_API_LOG` | `info` | Set to `off` to disable diagnostic logs |
 | `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
+
+The TypeScript personal workflow reads `ts/.env`. It is local-only and ignored by Git. A minimal file is:
+
+```env
+PORT=8787
+PROXY_API_KEY=<generated by npm run setup>
+CLOUDFLARE_TUNNEL_TOKEN=<named tunnel token>
+PUBLIC_URL=https://luna.example.com
+```
 
 The server also reads root-level Codex CLI reasoning and context settings from `~/.codex/config.toml`:
 

@@ -11,3 +11,9 @@ rust/target/
 uv.lock
 ts/node_modules/
 ts/dist/
+.env
+.env.*
+ts/.env
+ts/.env.*
+!.env.example
+!ts/.env.example

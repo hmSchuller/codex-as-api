@@ -41,6 +41,11 @@
   "scripts": {
     "build": "tsup",
     "test": "npx tsx --test src/__tests__/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "setup": "npm run build && node dist/setup.js",
+    "start": "npm run build && node dist/cli.js",
+    "local": "npm run build && node dist/cli.js --local",
+    "config": "npm run build && node dist/setup.js --config",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

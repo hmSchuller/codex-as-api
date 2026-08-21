@@ -37,8 +37,6 @@ import {
 } from "./model-catalog.js";
 import { countO200kOrdinaryTokens } from "./o200k-tokenizer.js";
 
-const HOST = process.env.HOST || process.env.CODEX_AS_API_HOST || "127.0.0.1";
-const PORT = parseInt(process.env.PORT || process.env.CODEX_AS_API_PORT || "8787", 10);
 const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const KNOWN_CODEX_MODELS = new Set(Object.keys(
@@ -1825,14 +1823,4 @@ function bundledCatalog(): ModelCatalogEntry[] {
     supportedInApi: true,
     capabilities: { ...metadata },
   }));
-}
-
-export function main(): void {
-  if (!process.env.PROXY_API_KEY?.trim()) {
-    throw new Error("PROXY_API_KEY must be set before starting the proxy");
-  }
-  const app = createApp();
-  app.listen(PORT, HOST, () => {
-    console.log(`codex-as-api listening on ${HOST}:${PORT}`);
-  });
 }

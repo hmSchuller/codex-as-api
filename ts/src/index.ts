@@ -8,7 +8,8 @@ export {
   CHATGPT_OAUTH_DEFAULT_BASE_URL,
   CHATGPT_OAUTH_DEFAULT_MODEL,
 } from "./provider.js";
-export { createApp, main, type CreateAppOptions } from "./server.js";
+export { createApp, type CreateAppOptions } from "./server.js";
+export { main, type MainOptions } from "./runtime.js";
 export {
   ChatGPTOAuthError,
   ChatGPTOAuthInvalidRequestError,
@@ -52,3 +53,21 @@ export {
   anthropicStreamAdapter,
   formatAnthropicError,
 } from "./anthropic-adapter.js";
+export {
+  CloudflareTunnel,
+  cloudflaredInstallInstruction,
+  findCloudflared,
+  type CloudflareExit,
+  type CloudflareTunnelOptions,
+} from "./cloudflare.js";
+export {
+  ConfigError,
+  cursorBaseUrl,
+  generateProxyApiKey,
+  loadAppConfig,
+  loadDotEnv,
+  normalizePublicUrl,
+  readDotEnv,
+  writeMissingDotEnvValues,
+  type AppConfig,
+} from "./config.js";
