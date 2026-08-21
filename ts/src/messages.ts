@@ -1,5 +1,6 @@
 export enum MessageRole {
   SYSTEM = "system",
+  DEVELOPER = "developer",
   USER = "user",
   ASSISTANT = "assistant",
   TOOL = "tool",
@@ -61,6 +62,7 @@ export interface ToolSchema {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  strict?: boolean;
   allowed_callers?: unknown;
   output_schema?: unknown;
 }

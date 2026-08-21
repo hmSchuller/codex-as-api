@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import express, { type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import modelCapabilityData from "../../config/model-capabilities.json";
 import {
   ChatGPTOAuthError,
@@ -29,11 +29,17 @@ import {
 } from "./anthropic-adapter.js";
 import { loadCodexConfig, type CodexConfig } from "./codex-config.js";
 import { capabilityForModel } from "./model-capabilities.js";
+import {
+  normalizeModelCatalog,
+  publicModelsFromCatalog,
+  resolveModelAlias,
+  type ModelCatalogEntry,
+} from "./model-catalog.js";
 import { countO200kOrdinaryTokens } from "./o200k-tokenizer.js";
 
-const HOST = process.env.CODEX_AS_API_HOST || "127.0.0.1";
-const PORT = parseInt(process.env.CODEX_AS_API_PORT || "18080", 10);
-const DEFAULT_MODEL = "gpt-5.5";
+const HOST = process.env.HOST || process.env.CODEX_AS_API_HOST || "127.0.0.1";
+const PORT = parseInt(process.env.PORT || process.env.CODEX_AS_API_PORT || "8787", 10);
+const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const KNOWN_CODEX_MODELS = new Set(Object.keys(
   (modelCapabilityData as { models?: Record<string, unknown> }).models ?? {},
@@ -126,22 +132,92 @@ export interface CreateAppOptions {
   codexConfig?: CodexConfig;
   model?: string;
   authPath?: string;
+  proxyApiKey?: string;
+}
+
+interface ModelCatalogProvider {
+  listModels?: () => Promise<unknown>;
+}
+
+class ModelCatalogStore {
+  private value: ModelCatalogEntry[] | null = null;
+  private loadedAt = 0;
+  private loading: Promise<ModelCatalogEntry[]> | null = null;
+
+  constructor(
+    private readonly provider: ModelCatalogProvider,
+    private readonly fallback: ModelCatalogEntry[],
+  ) {}
+
+  async get(required = false): Promise<ModelCatalogEntry[]> {
+    const ttl = Number.parseInt(
+      process.env.CODEX_AS_API_MODEL_CATALOG_TTL_MS || "300000",
+      10,
+    );
+    if (this.value != null && Date.now() - this.loadedAt < (Number.isFinite(ttl) ? ttl : 300000)) {
+      return this.value;
+    }
+    if (this.loading != null) return this.loading;
+    if (this.provider.listModels == null) {
+      if (required && this.fallback.length === 0) {
+        throw new ChatGPTOAuthError("authenticated Codex model catalog is unavailable");
+      }
+      return this.fallback;
+    }
+    this.loading = this.provider.listModels()
+      .then((raw) => normalizeModelCatalog(raw))
+      .then((catalog) => {
+        this.value = catalog;
+        this.loadedAt = Date.now();
+        return catalog;
+      })
+      .finally(() => {
+        this.loading = null;
+      });
+    return this.loading;
+  }
 }
 
 export function createApp(opts?: CreateAppOptions): express.Express {
   const codexConfig = opts?.codexConfig ?? loadCodexConfig();
   const envModel = process.env.CODEX_AS_API_MODEL?.trim() || undefined;
-  const model = opts?.model ?? envModel ?? codexConfig.model ?? DEFAULT_MODEL;
+  const model = opts?.model ?? envModel ?? DEFAULT_MODEL;
   const authPath = opts?.authPath ?? process.env.CODEX_AS_API_AUTH_PATH;
   const provider =
     opts?.provider ??
     new ChatGPTOAuthProvider({
       model,
       authJsonPath: authPath,
-    });
+      });
+
+  const catalogStore = new ModelCatalogStore(
+    provider as unknown as ModelCatalogProvider,
+    bundledCatalog(),
+  );
+  const proxyApiKey = opts?.proxyApiKey ?? process.env.PROXY_API_KEY?.trim();
 
   const app = express();
   app.use(express.json({ limit: "50mb" }));
+  app.use("/v1", proxyAuthentication(proxyApiKey));
+
+  async function resolveRequestModel(requestedModel: string): Promise<ReturnType<typeof resolveModelAlias>> {
+    // Luna visibility and aliases are account-sensitive. Legacy secondary
+    // model IDs retain the existing transport behavior without adding a
+    // catalog round trip to every compatibility request.
+    const catalog = requestedModel.startsWith("gpt-5.6-luna")
+      ? await catalogStore.get(true)
+      : bundledCatalog();
+    const resolved = resolveModelAlias(requestedModel, catalog);
+    if (
+      requestedModel.startsWith("gpt-5.6-luna")
+      && resolved.catalogEntry == null
+    ) {
+      throw new ChatGPTOAuthError(
+        `model ${JSON.stringify(requestedModel)} is not exposed by the authenticated Codex account; Luna was not found in its model catalog`,
+      );
+    }
+    return resolved;
+  }
 
   app.get("/health", (_req: Request, res: Response) => {
     try {
@@ -160,6 +236,15 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     }
   });
 
+  app.get("/v1/models", async (_req: Request, res: Response) => {
+    try {
+      const catalog = await catalogStore.get(true);
+      res.json({ object: "list", data: publicModelsFromCatalog(catalog) });
+    } catch (err) {
+      handleError(err, res);
+    }
+  });
+
   app.post(
     "/v1/chat/completions",
     async (req: Request, res: Response) => {
@@ -173,9 +258,21 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         const stop = normalizeStop(body.stop);
         const maxTokens =
           body.max_completion_tokens ?? body.max_tokens ?? undefined;
-        const requestModel = typeof body.model === "string" && body.model
+        const clientModel = typeof body.model === "string" && body.model
           ? body.model
           : model;
+        const selection = await resolveRequestModel(clientModel);
+        const requestModel = selection.upstreamModel;
+        if (selection.reasoningEffort != null) {
+          const nestedReasoning = isRecord(body.reasoning) ? body.reasoning.effort : undefined;
+          for (const explicit of [body.reasoning_effort, nestedReasoning]) {
+            if (explicit != null && explicit !== selection.reasoningEffort) {
+              throw new ChatGPTOAuthInvalidRequestError(
+                "reasoning effort conflicts with model reasoning alias",
+              );
+            }
+          }
+        }
 
         const subagent =
           body.subagent ||
@@ -192,9 +289,13 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         }
         const reasoning = resolveReasoning(
           body.reasoning,
-          body.reasoning_effort,
+          body.reasoning_effort ?? selection.reasoningEffort,
           codexConfig,
           requestModel,
+          selection.catalogEntry?.defaultReasoningEffort,
+        );
+        diagnosticLog(
+          `incoming model: ${clientModel} resolved model: ${requestModel} reasoning: ${reasoning?.effort ?? "none"}`,
         );
 
         const chatOpts = {
@@ -220,7 +321,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           parallelToolCalls: body.parallel_tool_calls,
         };
 
-        const modelId = `codex-oauth:${requestModel}`;
+        const modelId = `codex-oauth:${clientModel}`;
 
         if (body.stream) {
           // ChatGPTOAuthProvider builds and validates the deterministic request
@@ -251,6 +352,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           let usageDict: Record<string, unknown> | null = null;
           let upstreamResponseId: string | null = null;
           const toolCallIndices = new Map<string, number>();
+          const toolCallNames = new Set<string>();
 
           for await (const event of responseStream) {
             const typ = event.type;
@@ -299,8 +401,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                 ],
               };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            } else if (typ === "tool_call") {
+            } else if (typ === "tool_call_start") {
               const toolCallId = String(event.id ?? "");
+              if (typeof event.name === "string" && event.name) toolCallNames.add(event.name);
               let toolCallIndex = toolCallIndices.get(toolCallId);
               if (toolCallIndex == null) {
                 toolCallIndex = toolCallIndices.size;
@@ -311,10 +414,70 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                 id: toolCallId,
                 type: "function",
                 function: {
-                  name: event.name,
-                  arguments: JSON.stringify(
-                    event.arguments || {},
-                  ),
+                  name: String(event.name ?? ""),
+                  arguments: "",
+                },
+              };
+              const chunk = {
+                id: requestId,
+                object: "chat.completion.chunk",
+                created,
+                model: modelId,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { tool_calls: [tc] },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            } else if (typ === "tool_call_delta") {
+              const toolCallId = String(event.id ?? "");
+              let toolCallIndex = toolCallIndices.get(toolCallId);
+              if (toolCallIndex == null) {
+                toolCallIndex = toolCallIndices.size;
+                toolCallIndices.set(toolCallId, toolCallIndex);
+              }
+              const chunk = {
+                id: requestId,
+                object: "chat.completion.chunk",
+                created,
+                model: modelId,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [{
+                        index: toolCallIndex,
+                        id: toolCallId,
+                        type: "function",
+                        function: {
+                          name: "",
+                          arguments: String(event.arguments ?? ""),
+                        },
+                      }],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            } else if (typ === "tool_call") {
+              const toolCallId = String(event.id ?? "");
+              if (typeof event.name === "string" && event.name) toolCallNames.add(event.name);
+              let toolCallIndex = toolCallIndices.get(toolCallId);
+              if (toolCallIndex == null) {
+                toolCallIndex = toolCallIndices.size;
+                toolCallIndices.set(toolCallId, toolCallIndex);
+              }
+              const tc = {
+                index: toolCallIndex,
+                id: toolCallId,
+                type: "function",
+                function: {
+                  name: String(event.name ?? ""),
+                  arguments: JSON.stringify(event.arguments ?? {}),
                 },
               };
               const chunk = {
@@ -360,6 +523,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                 response_id: upstreamResponseId,
               };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              diagnosticLog(
+                `upstream status: 200 response ID: ${upstreamResponseId ?? "none"} tool calls: ${[...toolCallNames].join(", ") || "none"}`,
+              );
             }
           }
 
@@ -447,6 +613,10 @@ export function createApp(opts?: CreateAppOptions): express.Express {
               },
             };
           }
+
+          diagnosticLog(
+            `upstream status: 200 response ID: ${response.response_id ?? "none"} tool calls: ${response.tool_calls.map((call) => call.name).join(", ") || "none"}`,
+          );
 
           res.json(result);
         }
@@ -956,6 +1126,7 @@ function resolveReasoning(
   requestedEffort: unknown,
   config: CodexConfig,
   model: string,
+  catalogDefaultReasoningEffort?: string,
 ): ReasoningOptions | undefined {
   if (
     requestedReasoning != null
@@ -1020,6 +1191,7 @@ function resolveReasoning(
   const effort = explicitEffort
     ?? config.modelReasoningEffort
     ?? (mode != null ? "medium" : undefined)
+    ?? catalogDefaultReasoningEffort
     ?? capabilityForModel(model).defaultReasoningEffort;
   if (effort == null && mode == null && context == null) return undefined;
   const reasoning: ReasoningOptions = {};
@@ -1315,6 +1487,7 @@ function requestMessagesToInternal(
 function mapRole(role: string): MessageRole {
   const mapping: Record<string, MessageRole> = {
     system: MessageRole.SYSTEM,
+    developer: MessageRole.DEVELOPER,
     user: MessageRole.USER,
     assistant: MessageRole.ASSISTANT,
     tool: MessageRole.TOOL,
@@ -1493,11 +1666,12 @@ function parseTools(raw: unknown): ToolSchema[] | undefined {
       schemas.push({
         name: String(name),
         description: String(func.description || ""),
-        parameters: (typeof func.parameters === "object" &&
+          parameters: (typeof func.parameters === "object" &&
         func.parameters !== null
           ? func.parameters
           : {}) as Record<string, unknown>,
-      });
+          strict: typeof func.strict === "boolean" ? func.strict : undefined,
+        });
     }
   }
   return schemas.length ? schemas : undefined;
@@ -1595,7 +1769,68 @@ function normalizeStop(stop: unknown): string[] | undefined {
   return undefined;
 }
 
+function diagnosticLog(message: string): void {
+  const level = (process.env.CODEX_AS_API_LOG ?? "info").trim().toLowerCase();
+  if (level === "off" || level === "silent" || level === "none") return;
+  console.info(`[codex-as-api] ${message}`);
+}
+
+function proxyAuthentication(expectedKey: string | undefined) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (expectedKey == null || expectedKey.length === 0) {
+      next();
+      return;
+    }
+    const header = req.headers.authorization;
+    const prefix = "Bearer ";
+    if (typeof header !== "string" || !header.startsWith(prefix)) {
+      res.status(401).json({
+        error: { message: "proxy Authorization Bearer token is required", type: "authentication_error" },
+      });
+      return;
+    }
+    const provided = Buffer.from(header.slice(prefix.length), "utf8");
+    const expected = Buffer.from(expectedKey, "utf8");
+    if (
+      provided.length !== expected.length
+      || !crypto.timingSafeEqual(provided, expected)
+    ) {
+      res.status(401).json({
+        error: { message: "invalid proxy API key", type: "authentication_error" },
+      });
+      return;
+    }
+    next();
+  };
+}
+
+function bundledCatalog(): ModelCatalogEntry[] {
+  const models = (modelCapabilityData as {
+    models?: Record<string, Record<string, unknown>>;
+  }).models ?? {};
+  return Object.entries(models).map(([slug, metadata]) => ({
+    slug,
+    displayName: slug,
+    description: "Bundled transport capability metadata",
+    defaultReasoningEffort: typeof metadata.default_reasoning_effort === "string"
+      ? metadata.default_reasoning_effort
+      : undefined,
+    supportedReasoningLevels: [],
+    contextWindow: typeof metadata.context_window === "number"
+      ? metadata.context_window
+      : undefined,
+    maxContextWindow: typeof metadata.max_context_window === "number"
+      ? metadata.max_context_window
+      : undefined,
+    supportedInApi: true,
+    capabilities: { ...metadata },
+  }));
+}
+
 export function main(): void {
+  if (!process.env.PROXY_API_KEY?.trim()) {
+    throw new Error("PROXY_API_KEY must be set before starting the proxy");
+  }
   const app = createApp();
   app.listen(PORT, HOST, () => {
     console.log(`codex-as-api listening on ${HOST}:${PORT}`);

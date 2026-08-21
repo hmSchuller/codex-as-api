@@ -38,7 +38,7 @@ import {
 
 export const CHATGPT_OAUTH_DEFAULT_BASE_URL =
   "https://chatgpt.com/backend-api/codex";
-export const CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5";
+export const CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.6-luna";
 const REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]";
 const CODEX_CLI_ORIGINATOR = "codex_cli_rs";
 const CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION";
@@ -263,6 +263,7 @@ export class ChatGPTOAuthProvider {
     const contentParts: string[] = [];
     let reasoningParts: string[] = [];
     const toolCalls: ToolCall[] = [];
+    const toolArgumentBuffers = new Map<string, string>();
     let finishReason = "stop";
     const rawEvents: Record<string, unknown>[] = [];
     let usage: Usage | null = null;
@@ -277,12 +278,31 @@ export class ChatGPTOAuthProvider {
         event.type === "reasoning_raw_delta"
       ) {
         reasoningParts.push(String(event.text ?? ""));
+      } else if (event.type === "tool_call_start") {
+        const id = String(event.id);
+        if (!toolCalls.some((call) => call.id === id)) {
+          toolCalls.push({ id, name: String(event.name ?? ""), arguments: {} });
+        }
+      } else if (event.type === "tool_call_delta") {
+        const id = String(event.id);
+        const existing = toolCalls.find((call) => call.id === id);
+        if (existing) toolArgumentBuffers.set(
+          id,
+          `${toolArgumentBuffers.get(id) ?? ""}${String(event.arguments ?? "")}`,
+        );
       } else if (event.type === "tool_call") {
-        toolCalls.push({
-          id: String(event.id),
-          name: String(event.name),
-          arguments: (event.arguments as Record<string, unknown>) || {},
-        });
+        const id = String(event.id);
+        const existing = toolCalls.find((call) => call.id === id);
+        if (existing) {
+          existing.name = String(event.name ?? existing.name);
+          existing.arguments = (event.arguments as Record<string, unknown>) || {};
+        } else {
+          toolCalls.push({
+            id,
+            name: String(event.name),
+            arguments: (event.arguments as Record<string, unknown>) || {},
+          });
+        }
       } else if (event.type === "finish") {
         finishReason = String(event.finish_reason ?? finishReason);
         if (typeof event.reasoning_content === "string") {
@@ -295,6 +315,12 @@ export class ChatGPTOAuthProvider {
       }
     }
 
+    for (const call of toolCalls) {
+      const rawArguments = toolArgumentBuffers.get(call.id);
+      if (rawArguments == null) continue;
+      call.arguments = parseToolArguments(rawArguments);
+    }
+
     return {
       content: contentParts.join(""),
       tool_calls: toolCalls,
@@ -304,6 +330,10 @@ export class ChatGPTOAuthProvider {
       raw: { events: compactRawEvents(rawEvents) },
       response_id: responseId,
     };
+  }
+
+  async listModels(): Promise<unknown> {
+    return this.getJSON(`/models?client_version=${encodeURIComponent(resolveCodexCliVersion())}`);
   }
 
   chatStream(
@@ -337,6 +367,8 @@ export class ChatGPTOAuthProvider {
     const finalOutput: Record<string, unknown>[] = [];
     const reasoningParts: string[] = [];
     const yieldedWebSearchIds = new Set<string>();
+    const startedToolCallIds = new Set<string>();
+    const toolCallIdsWithDeltas = new Set<string>();
     let sawTextDelta = false;
     let sawReasoningDelta = false;
     let sawToolCall = false;
@@ -354,6 +386,46 @@ export class ChatGPTOAuthProvider {
           sawTextDelta = true;
           yield { type: "content", text: delta };
         }
+      } else if (typ === "response.output_item.added") {
+        const item = event.item;
+        if (isRecord(item) && (item.type === "function_call" || item.type === "custom_tool_call")) {
+          const tool = toolCallFromResponseItem(item);
+          if (tool) {
+            sawToolCall = true;
+            startedToolCallIds.add(tool.id);
+            yield { type: "tool_call_start", id: tool.id, name: tool.name, arguments: "" };
+            const rawArguments = item.arguments ?? item.input;
+            const argumentDelta = typeof rawArguments === "string"
+              ? rawArguments
+              : rawArguments == null
+                ? ""
+                : JSON.stringify(rawArguments);
+            if (argumentDelta) {
+              toolCallIdsWithDeltas.add(tool.id);
+              yield { type: "tool_call_delta", id: tool.id, arguments: argumentDelta };
+            }
+          }
+        }
+      } else if (
+        typ === "response.function_call_arguments.delta"
+        || typ === "response.custom_tool_call_input.delta"
+      ) {
+        const delta = event.delta ?? event.input;
+        const id = String(event.call_id ?? event.item_id ?? event.id ?? "");
+        if (typeof delta === "string" && delta && id) {
+          if (!startedToolCallIds.has(id)) {
+            startedToolCallIds.add(id);
+            yield {
+              type: "tool_call_start",
+              id,
+              name: typeof event.name === "string" ? event.name : "",
+              arguments: "",
+            };
+          }
+          toolCallIdsWithDeltas.add(id);
+          sawToolCall = true;
+          yield { type: "tool_call_delta", id, arguments: delta };
+        }
       } else if (typ === "response.output_item.done") {
         const item = event.item;
         if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -364,7 +436,7 @@ export class ChatGPTOAuthProvider {
         const itemDict = item as Record<string, unknown>;
         finalOutput.push(itemDict);
         const tool = toolCallFromResponseItem(itemDict);
-        if (tool) {
+        if (tool && !toolCallIdsWithDeltas.has(tool.id)) {
           sawToolCall = true;
           yield {
             type: "tool_call",
@@ -886,6 +958,52 @@ export class ChatGPTOAuthProvider {
     throw new Error("unreachable");
   }
 
+  private async getJSON(path: string): Promise<Record<string, unknown>> {
+    let tokenValues: (string | null)[] = [null];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const token = await tokenForRequest(this.authJsonPath);
+      const headers = this.getHeaders(token);
+      headers.Accept = "application/json";
+      tokenValues = [
+        token.access_token,
+        token.refresh_token,
+        token.id_token,
+        token.account_id,
+      ];
+      let response: Response;
+      try {
+        response = await fetch(this.baseUrl + path, {
+          method: "GET",
+          headers,
+          signal: this.timeout
+            ? AbortSignal.timeout(this.timeout)
+            : undefined,
+        });
+      } catch (err) {
+        throw new ChatGPTOAuthError(
+          `ChatGPT OAuth request failed: ${redactText(String(err), ...tokenValues)}`,
+        );
+      }
+      if (!response.ok) {
+        const body = redactText(await response.text(), ...tokenValues);
+        if (response.status === 401 && attempt === 0) {
+          await refreshAfterUnauthorized(token);
+          continue;
+        }
+        throw new ChatGPTOAuthUpstreamError(
+          response.status,
+          `ChatGPT OAuth request failed: HTTP ${response.status}: ${body}`,
+        );
+      }
+      const data = await response.json();
+      if (typeof data !== "object" || data === null || Array.isArray(data)) {
+        throw new ChatGPTOAuthError("ChatGPT OAuth model catalog must be a JSON object");
+      }
+      return data as Record<string, unknown>;
+    }
+    throw new Error("unreachable");
+  }
+
   private async *postSSE(
     path: string,
     payload: Record<string, unknown>,
@@ -1131,8 +1249,11 @@ export function messagesToResponseItems(
       continue;
     }
 
-    const role =
-      message.role === MessageRole.ASSISTANT ? "assistant" : "user";
+    const role = message.role === MessageRole.ASSISTANT
+      ? "assistant"
+      : message.role === MessageRole.DEVELOPER
+        ? "developer"
+        : "user";
     items.push(messageItem(
       role,
       message.content,
@@ -1218,7 +1339,7 @@ export function toolSchemaToResponseDict(
     name: tool.name,
     description: tool.description,
     parameters: tool.parameters,
-    strict: false,
+    strict: tool.strict ?? false,
   };
 }
 
@@ -1831,6 +1952,22 @@ export function toolCallFromResponseItem(
       crypto.randomUUID().replace(/-/g, ""),
   );
   return { id: callId, name, arguments: args };
+}
+
+function parseToolArguments(raw: string): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : { input: parsed };
+  } catch {
+    return { input: raw };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function textFromResponseItems(

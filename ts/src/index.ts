@@ -39,6 +39,14 @@ export {
   reasoningFromResponseItems,
 } from "./protocol.js";
 export {
+  normalizeModelCatalog,
+  publicModelsFromCatalog,
+  resolveModelAlias,
+  type ModelCatalogEntry,
+  type ReasoningLevel,
+  type ResolvedModel,
+} from "./model-catalog.js";
+export {
   anthropicRequestToInternal,
   internalResponseToAnthropic,
   anthropicStreamAdapter,

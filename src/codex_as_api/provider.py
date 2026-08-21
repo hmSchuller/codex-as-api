@@ -7,6 +7,7 @@ import platform
 import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
@@ -46,7 +47,7 @@ from .protocol import (
 )
 
 CHATGPT_OAUTH_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
-CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5"
+CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.6-luna"
 REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]"
 CODEX_CLI_ORIGINATOR = "codex_cli_rs"
 CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION"
@@ -282,6 +283,7 @@ class ChatGPTOAuthProvider:
         raw_events: list[dict[str, Any]] = []
         usage: Usage | None = None
         response_id: str | None = None
+        tool_argument_buffers: dict[str, str] = {}
         for event in self.chat_stream(
             messages,
             model=model,
@@ -313,9 +315,28 @@ class ChatGPTOAuthProvider:
             elif event.get("type") in {"reasoning_delta", "reasoning_raw_delta"}:
                 reasoning_parts.append(str(event.get("text", "")))
             elif event.get("type") == "tool_call":
-                tool_calls.append(
-                    ToolCall(id=str(event["id"]), name=str(event["name"]), arguments=dict(event.get("arguments") or {}))
-                )
+                call_id = str(event["id"])
+                existing = next((call for call in tool_calls if call.id == call_id), None)
+                if existing is None:
+                    tool_calls.append(
+                        ToolCall(id=call_id, name=str(event["name"]), arguments=dict(event.get("arguments") or {}))
+                    )
+                else:
+                    index = tool_calls.index(existing)
+                    tool_calls[index] = ToolCall(
+                        id=call_id,
+                        name=str(event.get("name") or existing.name),
+                        arguments=dict(event.get("arguments") or {}),
+                    )
+            elif event.get("type") == "tool_call_start":
+                call_id = str(event["id"])
+                if not any(call.id == call_id for call in tool_calls):
+                    tool_calls.append(ToolCall(id=call_id, name=str(event.get("name") or ""), arguments={}))
+            elif event.get("type") == "tool_call_delta":
+                # The final tool-call item is retained in the response history;
+                # deltas only let streaming callers receive arguments early.
+                call_id = str(event["id"])
+                tool_argument_buffers[call_id] = tool_argument_buffers.get(call_id, "") + str(event.get("arguments") or "")
             elif event.get("type") == "finish":
                 finish_reason = str(event.get("finish_reason") or finish_reason)
                 if isinstance(event.get("reasoning_content"), str):
@@ -323,6 +344,14 @@ class ChatGPTOAuthProvider:
                 usage = _usage_from_response(event.get("usage")) or usage
                 if isinstance(event.get("response_id"), str):
                     response_id = str(event["response_id"])
+        for index, call in enumerate(tool_calls):
+            raw_arguments = tool_argument_buffers.get(call.id)
+            if raw_arguments is not None:
+                tool_calls[index] = ToolCall(
+                    id=call.id,
+                    name=call.name,
+                    arguments=_parse_tool_arguments(raw_arguments),
+                )
         return AssistantResponse(
             content="".join(content_parts),
             tool_calls=tuple(tool_calls),
@@ -332,6 +361,14 @@ class ChatGPTOAuthProvider:
             response_id=response_id,
             raw={"events": _compact_raw_events(raw_events)},
         )
+
+    def list_models(self) -> dict[str, Any]:
+        client_version = urllib.parse.quote(resolve_codex_cli_version(), safe="")
+        raw = self._request_json(f"/models?client_version={client_version}", None, method="GET")
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ChatGPTOAuthError("ChatGPT OAuth model catalog must be a JSON object")
+        return data
 
     def chat_stream(
         self,
@@ -398,6 +435,8 @@ class ChatGPTOAuthProvider:
         final_output: list[dict[str, Any]] = []
         reasoning_parts: list[str] = []
         yielded_web_search_ids: set[str] = set()
+        started_tool_call_ids: set[str] = set()
+        tool_call_ids_with_deltas: set[str] = set()
         saw_text_delta = False
         saw_reasoning_delta = False
         saw_function_tool_call = False
@@ -408,13 +447,37 @@ class ChatGPTOAuthProvider:
                 if isinstance(delta, str) and delta:
                     saw_text_delta = True
                     yield {"type": "content", "text": delta}
+            elif typ == "response.output_item.added":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}:
+                    tool = _tool_call_from_response_item(item)
+                    if tool is not None:
+                        saw_function_tool_call = True
+                        started_tool_call_ids.add(tool.id)
+                        yield {"type": "tool_call_start", "id": tool.id, "name": tool.name, "arguments": ""}
+                        raw_arguments = item.get("arguments", item.get("input"))
+                        if raw_arguments:
+                            argument_delta = raw_arguments if isinstance(raw_arguments, str) else json.dumps(raw_arguments)
+                            tool_call_ids_with_deltas.add(tool.id)
+                            yield {"type": "tool_call_delta", "id": tool.id, "arguments": argument_delta}
+            elif typ in {"response.function_call_arguments.delta", "response.custom_tool_call_input.delta"}:
+                delta = event.get("delta", event.get("input"))
+                call_id = event.get("call_id") or event.get("item_id") or event.get("id")
+                if isinstance(delta, str) and delta and call_id:
+                    call_id = str(call_id)
+                    if call_id not in started_tool_call_ids:
+                        started_tool_call_ids.add(call_id)
+                        yield {"type": "tool_call_start", "id": call_id, "name": str(event.get("name") or ""), "arguments": ""}
+                    tool_call_ids_with_deltas.add(call_id)
+                    saw_function_tool_call = True
+                    yield {"type": "tool_call_delta", "id": call_id, "arguments": delta}
             elif typ == "response.output_item.done":
                 item = event.get("item")
                 if not isinstance(item, dict):
                     raise ChatGPTOAuthError("response.output_item.done must contain an object item")
                 final_output.append(item)
                 tool = _tool_call_from_response_item(item)
-                if tool is not None:
+                if tool is not None and tool.id not in tool_call_ids_with_deltas:
                     saw_function_tool_call = True
                     yield {"type": "tool_call", "id": tool.id, "name": tool.name, "arguments": tool.arguments}
                 web_search = _web_search_event_from_response_item(item)
@@ -877,8 +940,9 @@ class ChatGPTOAuthProvider:
     def _request_json(
         self,
         path: str,
-        payload: dict[str, Any],
+        payload: dict[str, Any] | None,
         extra_headers: dict[str, str] | None = None,
+        method: str = "POST",
     ) -> bytes:
         token_values: tuple[str | None, ...] = (None,)
         for attempt in range(2):
@@ -889,9 +953,9 @@ class ChatGPTOAuthProvider:
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
             req = urllib.request.Request(
                 self.base_url + path,
-                data=json.dumps(payload).encode("utf-8"),
+                data=None if method == "GET" else json.dumps(payload or {}).encode("utf-8"),
                 headers=headers,
-                method="POST",
+                method=method,
             )
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:
@@ -1084,7 +1148,13 @@ def _messages_to_response_items(messages: Sequence[Message]) -> list[dict[str, A
                     }
                 )
             continue
-        role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
+        role = (
+            "assistant"
+            if message.role is MessageRole.ASSISTANT
+            else "developer"
+            if message.role is MessageRole.DEVELOPER
+            else "user"
+        )
         items.append(
             _message_item(
                 role,
@@ -1136,7 +1206,7 @@ def _tool_schema_to_response_dict(tool: ToolSchema) -> dict[str, Any]:
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.parameters,
-        "strict": False,
+        "strict": tool.strict if tool.strict is not None else False,
     }
 
 
@@ -1572,6 +1642,16 @@ def _tool_call_from_response_item(item: dict[str, Any]) -> ToolCall | None:
         args = {}
     call_id = item.get("call_id") or item.get("id") or uuid.uuid4().hex
     return ToolCall(id=str(call_id), name=name, arguments=args)
+
+
+def _parse_tool_arguments(raw: str) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"input": raw}
+    return parsed if isinstance(parsed, dict) else {"input": parsed}
 
 
 def _text_from_response_items(items: Sequence[dict[str, Any]]) -> str:

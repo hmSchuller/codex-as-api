@@ -6,6 +6,7 @@ import enum
 
 class MessageRole(enum.Enum):
     SYSTEM = "system"
+    DEVELOPER = "developer"
     USER = "user"
     ASSISTANT = "assistant"
     TOOL = "tool"
@@ -119,3 +120,4 @@ class ToolSchema:
     name: str
     description: str
     parameters: dict
+    strict: bool | None = None

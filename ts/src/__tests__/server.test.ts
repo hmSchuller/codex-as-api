@@ -711,7 +711,7 @@ describe("server model defaults", () => {
     });
   });
 
-  it("treats an empty CODEX_AS_API_MODEL as absent", async () => {
+  it("uses Luna when CODEX_AS_API_MODEL is empty", async () => {
     const previous = process.env.CODEX_AS_API_MODEL;
     process.env.CODEX_AS_API_MODEL = "";
     try {
@@ -719,8 +719,8 @@ describe("server model defaults", () => {
         const response = await fetch(`${baseUrl}/health`);
         assert.equal(response.status, 200);
         const body = await response.json() as Record<string, unknown>;
-        assert.equal(body.model, "gpt-5.6-sol");
-        assert.equal(body.reasoning_effort, "low");
+        assert.equal(body.model, "gpt-5.6-luna");
+        assert.equal(body.reasoning_effort, "medium");
         assert.equal(body.context_window, 272_000);
       }, {
         model: null,

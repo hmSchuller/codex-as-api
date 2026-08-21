@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import time
 import uuid
 from collections.abc import Iterator
@@ -18,6 +19,12 @@ from .auth import (
 from .codex_config import load_codex_config
 from .messages import Message, MessageRole, ToolSchema
 from .model_capabilities import capability_for_model, load_model_capabilities
+from .model_catalog import (
+    ModelCatalogEntry,
+    normalize_model_catalog,
+    public_models_from_catalog,
+    resolve_model_alias,
+)
 from .o200k_tokenizer import count_ordinary
 from .provider import ChatGPTOAuthProvider
 
@@ -35,10 +42,10 @@ def _env_str(name: str, default: str) -> str:
     return normalized or default
 
 
-HOST = _env_str("CODEX_AS_API_HOST", "127.0.0.1")
-PORT = _env_int("CODEX_AS_API_PORT", 18080)
+HOST = _env_str("HOST", _env_str("CODEX_AS_API_HOST", "127.0.0.1"))
+PORT = _env_int("PORT", _env_int("CODEX_AS_API_PORT", 8787))
 CODEX_CONFIG = load_codex_config()
-MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model or "gpt-5.5")
+MODEL = _env_str("CODEX_AS_API_MODEL", "gpt-5.6-luna")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 DEFAULT_CONTEXT_WINDOW = 200_000
 CLAUDE_CODE_SESSION_HEADER = "x-claude-code-session-id"
@@ -46,6 +53,8 @@ _CLAUDE_CACHE_KEY_NAMESPACE = "codex-as-api:claude-code-session:"
 _ANTHROPIC_CACHE_CONTROL_TTLS = frozenset({"5m", "1h"})
 
 _provider: ChatGPTOAuthProvider | None = None
+_model_catalog: list[ModelCatalogEntry] | None = None
+_model_catalog_loaded_at = 0.0
 
 
 def _get_provider() -> ChatGPTOAuthProvider:
@@ -56,6 +65,48 @@ def _get_provider() -> ChatGPTOAuthProvider:
             auth_json_path=AUTH_PATH,
         )
     return _provider
+
+
+def _bundled_model_catalog() -> list[ModelCatalogEntry]:
+    return [
+        ModelCatalogEntry(
+            slug=slug,
+            display_name=slug,
+            description="Bundled transport capability metadata",
+            default_reasoning_effort=capability.default_reasoning_effort,
+            supported_reasoning_levels=(),
+            context_window=capability.context_window,
+            max_context_window=capability.max_context_window,
+            supported_in_api=True,
+            capabilities={},
+        )
+        for slug, capability in load_model_capabilities().items()
+    ]
+
+
+def _get_model_catalog(provider: ChatGPTOAuthProvider) -> list[ModelCatalogEntry]:
+    global _model_catalog, _model_catalog_loaded_at
+    ttl_ms = _env_int("CODEX_AS_API_MODEL_CATALOG_TTL_MS", 300_000)
+    if _model_catalog is not None and time.time() * 1000 - _model_catalog_loaded_at < ttl_ms:
+        return _model_catalog
+    raw = provider.list_models()
+    try:
+        catalog = normalize_model_catalog(raw)
+    except ValueError as exc:
+        raise ChatGPTOAuthError(str(exc)) from exc
+    _model_catalog = catalog
+    _model_catalog_loaded_at = time.time() * 1000
+    return catalog
+
+
+def _resolve_request_model(provider: ChatGPTOAuthProvider, requested_model: str):
+    catalog = _get_model_catalog(provider) if requested_model.startswith("gpt-5.6-luna") else _bundled_model_catalog()
+    resolved = resolve_model_alias(requested_model, catalog)
+    if requested_model.startswith("gpt-5.6-luna") and resolved.catalog_entry is None:
+        raise ChatGPTOAuthInvalidRequestError(
+            f"model {requested_model!r} is not exposed by the authenticated Codex account; Luna was not found"
+        )
+    return resolved
 
 
 def _is_context_window_error(exc: BaseException | str) -> bool:
@@ -220,6 +271,19 @@ try:
         version="0.6.5",
     )
 
+    @app.middleware("http")
+    async def _proxy_authentication(request: Request, call_next: Any) -> Any:
+        expected = os.getenv("PROXY_API_KEY", "").strip()
+        if expected and request.url.path.startswith("/v1"):
+            authorization = request.headers.get("authorization", "")
+            provided = authorization.removeprefix("Bearer ")
+            if not authorization.startswith("Bearer ") or not secrets.compare_digest(provided, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": {"message": "invalid proxy API key", "type": "authentication_error"}},
+                )
+        return await call_next(request)
+
     @app.exception_handler(ChatGPTOAuthError)
     async def _chatgpt_oauth_error_handler(_request: Request, exc: ChatGPTOAuthError) -> JSONResponse:
         status = _error_status(exc)
@@ -237,7 +301,7 @@ try:
         tool_call_id: str | None = None
 
     class ChatCompletionRequest(BaseModel):
-        model: str
+        model: str = MODEL
         messages: list[ChatMessage]
         stream: bool = False
         temperature: float | None = None
@@ -310,6 +374,7 @@ try:
     def _map_role(role: str) -> MessageRole:
         mapping = {
             "system": MessageRole.SYSTEM,
+            "developer": MessageRole.DEVELOPER,
             "user": MessageRole.USER,
             "assistant": MessageRole.ASSISTANT,
             "tool": MessageRole.TOOL,
@@ -433,7 +498,10 @@ try:
             if name:
                 schemas.append(
                     ToolSchema(
-                        name=str(name), description=str(desc), parameters=params if isinstance(params, dict) else {}
+                        name=str(name),
+                        description=str(desc),
+                        parameters=params if isinstance(params, dict) else {},
+                        strict=func.get("strict") if isinstance(func.get("strict"), bool) else None,
                     )
                 )
         return schemas if schemas else None
@@ -644,6 +712,15 @@ try:
             "reasoning_effort": _configured_reasoning_effort(),
         }
 
+    @app.get("/v1/models")
+    async def models() -> dict[str, Any]:
+        provider = _get_provider()
+        try:
+            catalog = _get_model_catalog(provider)
+        except ValueError as exc:
+            raise ChatGPTOAuthError(str(exc)) from exc
+        return {"object": "list", "data": public_models_from_catalog(catalog, int(time.time()))}
+
     @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(
         request: ChatCompletionRequest, http_request: Request
@@ -656,7 +733,9 @@ try:
                 "tools": request.tools,
             }
         )
-        messages = _request_messages_to_internal(request.messages, model=request.model)
+        selection = _resolve_request_model(provider, request.model)
+        request_model = selection.upstream_model
+        messages = _request_messages_to_internal(request.messages, model=request_model)
         tools = _parse_tools(request.tools)
         stop = _normalize_stop(request.stop)
         max_tokens = _max_tokens_from_request(request)
@@ -671,11 +750,21 @@ try:
             request.reasoning_effort,
             request.reasoning,
         )
+        if selection.reasoning_effort is not None:
+            if reasoning_effort is not None and reasoning_effort != selection.reasoning_effort:
+                raise ChatGPTOAuthInvalidRequestError("reasoning_effort conflicts with model reasoning alias")
+            reasoning_effort = selection.reasoning_effort
+        elif (
+            reasoning_effort is None
+            and CODEX_CONFIG.model_reasoning_effort is None
+            and selection.catalog_entry is not None
+        ):
+            reasoning_effort = selection.catalog_entry.default_reasoning_effort
 
         if request.stream:
             prepared_request = provider.preflight_chat(
                 messages,
-                model=request.model,
+                model=request_model,
                 tools=tools,
                 tool_choice=request.tool_choice,
                 temperature=request.temperature,
@@ -721,13 +810,14 @@ try:
                 reasoning_parts: list[str] = []
                 content_parts: list[str] = []
                 tool_calls_buffer: list[dict[str, Any]] = []
+                tool_call_indices: dict[str, int] = {}
                 usage_dict: dict[str, Any] | None = None
 
                 def _provider_events() -> Iterator[dict[str, Any]]:
                     try:
                         yield from provider.chat_stream(
                             messages,
-                            model=request.model,
+                            model=request_model,
                             tools=tools,
                             tool_choice=request.tool_choice,
                             temperature=request.temperature,
@@ -813,18 +903,29 @@ try:
                             ],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
-                    elif typ == "tool_call":
-                        tool_index = len(tool_calls_buffer)
+                    elif typ in {"tool_call_start", "tool_call", "tool_call_delta"}:
+                        call_id = str(event.get("id") or "")
+                        tool_index = tool_call_indices.setdefault(call_id, len(tool_call_indices))
+                        if typ == "tool_call_start":
+                            name = str(event.get("name") or "")
+                            arguments = ""
+                        elif typ == "tool_call_delta":
+                            name = ""
+                            arguments = str(event.get("arguments") or "")
+                        else:
+                            name = str(event.get("name") or "")
+                            arguments = json.dumps(event.get("arguments") or {})
                         tc = {
                             "index": tool_index,
-                            "id": event.get("id"),
+                            "id": call_id,
                             "type": "function",
                             "function": {
-                                "name": event.get("name"),
-                                "arguments": json.dumps(event.get("arguments") or {}),
+                                "name": name,
+                                "arguments": arguments,
                             },
                         }
-                        tool_calls_buffer.append(tc)
+                        if tool_index == len(tool_calls_buffer):
+                            tool_calls_buffer.append(tc)
                         chunk = {
                             "id": request_id,
                             "object": "chat.completion.chunk",
@@ -895,7 +996,7 @@ try:
         # Non-streaming
         response = provider.chat(
             messages,
-            model=request.model,
+            model=request_model,
             tools=tools,
             tool_choice=request.tool_choice,
             temperature=request.temperature,
@@ -1322,6 +1423,8 @@ try:
     def main() -> None:
         import uvicorn
 
+        if not os.getenv("PROXY_API_KEY", "").strip():
+            raise RuntimeError("PROXY_API_KEY must be set before starting the proxy")
         uvicorn.run("codex_as_api.server:app", host=HOST, port=PORT, log_level="info")
 
 except ImportError as _import_exc:

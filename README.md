@@ -16,16 +16,16 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Image support** — generation, inspection, multimodal Chat input, and capability-gated `original` image detail in classic Responses
 - **Reasoning** — configurable effort/context, `standard` mode compatibility, persisted reasoning, and streaming thinking content
 - **Codex features** — session-aware `prompt_cache_key`, process-local Chat `response_id` continuation, subagent headers, and remote compaction
-- **Codex config aware** — reads `CODEX_HOME` / `~/.codex/config.toml` for model, reasoning-effort, and context-window settings
+- **Codex config aware** — reads `CODEX_HOME` / `~/.codex/config.toml` for reasoning-effort and context-window settings
 - **Token estimate & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
 - **Auto auth** — reads `~/.codex/auth.json` and auto-refreshes OAuth tokens
-- **3 implementations** — Python, TypeScript (npm), and Rust — identical behavior
+- **3 implementations** — Python, TypeScript (npm), and Rust share the Codex transport foundations; the TypeScript and Python servers include the Cursor Luna bridge
 
 ## What it does
 
 Runs a lightweight HTTP server on `localhost` that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend using your existing `~/.codex/auth.json` OAuth credentials.
 
-Python, Rust, and TypeScript (npm) implementations are provided — identical functionality, same endpoints, same behavior.
+Python, Rust, and TypeScript (npm) implementations are provided. Use the TypeScript or Python server for the Cursor + Luna bridge described below; Rust retains the lower-level compatibility implementation.
 
 ## Prerequisites
 
@@ -39,6 +39,67 @@ codex login
 The server reads that file to obtain and refresh ChatGPT OAuth tokens automatically.
 
 `tokens` and latest root-level `access_token` / `refresh_token` / `id_token` auth files are supported. `personal_access_token`-only, `agent_identity`-only, and `bedrock_api_key`-only auth files are not supported for the ChatGPT OAuth backend; rerun `codex login` if you hit that diagnostic.
+
+## Cursor + GPT-5.6 Luna via ChatGPT subscription
+
+This proxy keeps Cursor as the agent. Cursor supplies the system prompt, developer instructions, repository context, conversation history, tools, and tool execution loop; the proxy only authenticates and translates the inference request to the ChatGPT/Codex Responses backend.
+
+### Prerequisites
+
+1. Install the official Codex CLI and authenticate the ChatGPT account:
+
+   ```bash
+   npm install -g @openai/codex
+   codex login
+   ```
+
+2. Confirm that `~/.codex/auth.json` contains file-backed OAuth tokens. The proxy never uses the Cursor API key as an upstream credential.
+
+### Run the proxy
+
+The TypeScript server is the Cursor-focused implementation. Build it and start it with a proxy-only API key:
+
+```bash
+cd ts
+npm install
+npm run build
+HOST=127.0.0.1 PORT=8787 PROXY_API_KEY='<random-secret>' node dist/cli.js
+```
+
+`HOST` and `PORT` are aliases for the existing `CODEX_AS_API_HOST` and `CODEX_AS_API_PORT` settings. `PROXY_API_KEY` is required by the executable and must be sent as `Authorization: Bearer <PROXY_API_KEY>` on `/v1` requests. It is not an OpenAI or ChatGPT credential.
+
+Keep the server on localhost unless remote access is required. For a temporary HTTPS connection, use a tunnel such as `cloudflared tunnel --url http://127.0.0.1:8787` or put it behind an HTTPS reverse proxy that forwards only the `/v1` routes. Do not expose the process without `PROXY_API_KEY`, TLS, and access controls.
+
+### Configure Cursor
+
+Set Cursor's OpenAI-compatible provider to:
+
+```text
+Base URL: https://<proxy-host>/v1
+API key: <PROXY_API_KEY>
+```
+
+Use `GET /v1/models` to see the model IDs currently exposed by the authenticated Codex account. Add the Luna IDs returned there as Cursor custom models. A typical Luna catalog is:
+
+```text
+gpt-5.6-luna
+gpt-5.6-luna-medium
+gpt-5.6-luna-high
+gpt-5.6-luna-xhigh
+gpt-5.6-luna-max
+```
+
+The list is dynamic. The proxy creates a reasoning alias only when the upstream catalog advertises that exact effort for `gpt-5.6-luna`; it does not claim unsupported levels. `gpt-5.6-luna-high` sends `model: gpt-5.6-luna` and `reasoning.effort: high` upstream. The unsuffixed Luna model uses the catalog's advertised default effort, not a Sol-derived or globally forced value.
+
+### Troubleshooting and verification
+
+- `401` from the proxy means the Cursor API key is missing or incorrect. OAuth errors after that point refer to `~/.codex/auth.json` or its refresh token.
+- If Luna is absent from `GET /v1/models`, the authenticated account did not expose Luna in the Codex catalog. The proxy fails Luna requests clearly instead of silently switching to Sol.
+- Set `CODEX_AS_API_LOG=info` to log the incoming model, resolved upstream model, reasoning effort, upstream status, response ID, and tool names. Prompts and credentials are not logged.
+- Verify the request path with a model alias such as `gpt-5.6-luna-high` and check the diagnostic line for `resolved model: gpt-5.6-luna reasoning: high`.
+- Function tools are forwarded to Luna and returned to Cursor as Chat Completions tool calls. Cursor executes them; this proxy never executes tools.
+
+The proxy supports Chat Completions streaming and local full-history continuation for repeated tool turns. The private Codex Responses Lite route requires `all_turns` reasoning context and does not support hosted tools that need a standalone executor; Cursor-owned function tools remain supported.
 
 ## Install & Run
 
@@ -127,19 +188,21 @@ Environment variables (Python, Rust, and TypeScript):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CODEX_AS_API_HOST` | `127.0.0.1` | Bind address |
-| `CODEX_AS_API_PORT` | `18080` | Listen port |
-| `CODEX_AS_API_MODEL` | `~/.codex/config.toml` `model`, else `gpt-5.5` | Model identifier passed to Codex backend |
+| `HOST` / `CODEX_AS_API_HOST` | `127.0.0.1` | Bind address |
+| `PORT` / `CODEX_AS_API_PORT` | `8787` | Listen port |
+| `PROXY_API_KEY` | required by Python and TypeScript executables | Bearer secret required by `/v1` |
+| `CODEX_AS_API_MODEL` | `gpt-5.6-luna` in Python/TypeScript; Rust keeps its existing Codex-config fallback | Explicit proxy model override |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
 | `CODEX_AS_API_CODEX_CLI_VERSION` | `0.147.0` | Override the validated Codex compatibility baseline identified in backend request `User-Agent` headers |
 | `CODEX_AS_API_RESPONSES_LITE` | `auto` | Responses Lite mode: `auto`, `on`, or `off` |
 | `CODEX_AS_API_CODEX_METADATA` | `off` | Add Codex-style per-turn `client_metadata` and related backend headers |
+| `CODEX_AS_API_MODEL_CATALOG_TTL_MS` | `300000` | Cache duration for the authenticated Codex model catalog |
+| `CODEX_AS_API_LOG` | `info` | Set to `off` to disable diagnostic logs |
 | `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
 
-The server also reads root-level Codex CLI settings from `~/.codex/config.toml`:
+The server also reads root-level Codex CLI reasoning and context settings from `~/.codex/config.toml`:
 
 ```toml
-model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 
 # Optional overrides. Without them, known models use the bundled Codex catalog values.
@@ -147,7 +210,7 @@ model_context_window = 272000
 model_auto_compact_token_limit = 244800
 ```
 
-`CODEX_AS_API_MODEL` overrides the Codex config model. A request-level `reasoning_effort` overrides `model_reasoning_effort`; when both are omitted, known models use the Codex catalog default. The effective model, reasoning setting, and context settings are exposed from `/health`; context settings are also returned by Anthropic token-count responses.
+`CODEX_AS_API_MODEL` or a request-level model overrides the default Luna model. A request-level `reasoning_effort` overrides `model_reasoning_effort`; when both are omitted, known models use the Codex catalog default. The effective model, reasoning setting, and context settings are exposed from `/health`; context settings are also returned by Anthropic token-count responses.
 
 ### Supported Models
 
@@ -156,7 +219,7 @@ model_auto_compact_token_limit = 244800
 | `gpt-5.6` | Public alias; resolved to `gpt-5.6-sol` before the Codex OAuth request |
 | `gpt-5.6-sol` | Latest frontier agentic coding model; defaults to `low` effort in Codex |
 | `gpt-5.6-terra` | Balanced agentic coding model for everyday work; defaults to `medium` effort |
-| `gpt-5.6-luna` | Fast and affordable agentic coding model; defaults to `medium` effort |
+| `gpt-5.6-luna` | Primary Cursor target; default effort comes from the authenticated Codex catalog |
 | `gpt-5.5` | Frontier model for complex coding, research, and real-world work |
 | `gpt-5.4` | Strong model for everyday coding |
 | `gpt-5.4-mini` | Small, fast, and cost-efficient model for simpler coding tasks |
@@ -164,7 +227,7 @@ model_auto_compact_token_limit = 244800
 | `gpt-5.3-codex-spark` | Ultra-fast coding model |
 | `gpt-5.2` | Previous generation model |
 
-Model capability behavior is driven by `config/model-capabilities.json` across Python, TypeScript, and Rust. The public `gpt-5.6` alias uses Sol's private Codex capability entry. The GPT-5.6 entries use the official Codex Responses Lite contract and a 272,000-token **Codex OAuth** context-window maximum; do not substitute the larger public API context figures for this backend. Larger config overrides are clamped to 272,000. Unknown models use conservative behavior: classic Responses payloads, no assumed parallel tool support, no automatic verbosity, reasoning-effort, or service-tier fields, and, without config overrides, the legacy 200,000-token context / 160,000-token compact thresholds.
+Transport capability behavior is driven by `config/model-capabilities.json`. For Luna visibility, reasoning levels, defaults, context metadata, and account access, the TypeScript Cursor bridge uses the authenticated Codex `/models` catalog at runtime. The public `gpt-5.6` alias retains its existing Sol compatibility behavior. The GPT-5.6 entries use the official Codex Responses Lite contract and a 272,000-token **Codex OAuth** context-window maximum; do not substitute the larger public API context figures for this backend. Larger config overrides are clamped to 272,000. Unknown models use conservative behavior: classic Responses payloads, no assumed parallel tool support, no automatic verbosity, reasoning-effort, or service-tier fields, and, without config overrides, the legacy 200,000-token context / 160,000-token compact thresholds.
 
 To use a different port:
 
@@ -377,7 +440,7 @@ Health check. Returns auth availability, configured model and reasoning effort, 
 
 ```bash
 curl http://localhost:18080/health
-# {"status":"ok","auth_available":true,"model":"gpt-5.6-sol","reasoning_effort":"high","codex_config_path":"/Users/me/.codex/config.toml","context_window":272000,"auto_compact_token_limit":244800}
+# {"status":"ok","auth_available":true,"model":"gpt-5.6-luna","reasoning_effort":"high","codex_config_path":"/Users/me/.codex/config.toml","context_window":272000,"auto_compact_token_limit":244800}
 ```
 
 ## Codex-Specific Features

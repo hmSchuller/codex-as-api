@@ -1523,6 +1523,13 @@ def test_chat_completions_invalid_body_returns_422(client):
     assert resp.status_code == 422
 
 
+def test_chat_completion_request_uses_effective_model_default():
+    from codex_as_api.server import ChatCompletionRequest, MODEL
+
+    request = ChatCompletionRequest(messages=[])
+    assert request.model == MODEL
+
+
 def test_chat_completions_valid_schema_reaches_provider(client):
     payload = {
         "model": "gpt-5.5",
