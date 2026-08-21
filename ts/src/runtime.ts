@@ -106,7 +106,9 @@ export async function main(options: MainOptions = {}): Promise<void> {
     console.log(formatCursorConfiguration({
       baseUrl: publicUrl,
       apiKey: config.proxyApiKey,
-      models: models.filter((model) => model === "gpt-5.6-luna" || model.startsWith("gpt-5.6-luna-")),
+      models: models.filter((model) => model === "gpt-5.6-luna"
+        || model.startsWith("gpt-5.6-luna-")
+        || model.startsWith("luna-")),
     }));
     await stopped;
   } catch (err) {

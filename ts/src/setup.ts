@@ -19,10 +19,17 @@ import { loadTokenData } from "./auth.js";
 
 const DEFAULT_LUNA_MODELS = [
   "gpt-5.6-luna",
+  "gpt-5.6-luna-low",
   "gpt-5.6-luna-medium",
   "gpt-5.6-luna-high",
   "gpt-5.6-luna-xhigh",
   "gpt-5.6-luna-max",
+  "luna-low",
+  "luna-low-fast",
+  "luna-medium-fast",
+  "luna-high-fast",
+  "luna-xhigh-fast",
+  "luna-max-fast",
 ];
 
 export async function runSetup(): Promise<void> {

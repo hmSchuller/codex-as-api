@@ -16,6 +16,7 @@ const LUNA_CATALOG = {
     display_name: "GPT-5.6 Luna",
     default_reasoning_level: "medium",
     supported_reasoning_levels: [
+      { effort: "low", description: "Fast responses" },
       { effort: "medium", description: "Balanced" },
       { effort: "high", description: "More deliberate" },
       { effort: "xhigh", description: "Maximum analysis" },
@@ -24,6 +25,8 @@ const LUNA_CATALOG = {
     context_window: 272000,
     supports_parallel_tool_calls: true,
     use_responses_lite: true,
+    additional_speed_tiers: ["fast"],
+    service_tiers: [{ id: "priority", name: "Fast" }],
     supported_in_api: true,
   }],
 };
@@ -96,9 +99,19 @@ describe("GPT-5.6 Luna model catalog", () => {
       catalogEntry: catalog[0],
       alias: true,
     });
+    assert.deepEqual(resolveModelAlias("luna-xhigh-fast", catalog), {
+      requestedModel: "luna-xhigh-fast",
+      upstreamModel: "gpt-5.6-luna",
+      reasoningEffort: "xhigh",
+      serviceTier: "fast",
+      catalogEntry: catalog[0],
+      alias: true,
+    });
+    assert.equal(resolveModelAlias("luna-low-fast", catalog).reasoningEffort, "low");
+    assert.equal(resolveModelAlias("luna-low-fast", catalog).serviceTier, "fast");
     assert.equal(resolveModelAlias("gpt-5.6-luna", catalog).upstreamModel, "gpt-5.6-luna");
-    const unknown = resolveModelAlias("gpt-5.6-luna-low", catalog);
-    assert.equal(unknown.upstreamModel, "gpt-5.6-luna-low");
+    const unknown = resolveModelAlias("gpt-5.6-luna-unknown", catalog);
+    assert.equal(unknown.upstreamModel, "gpt-5.6-luna-unknown");
     assert.equal(unknown.reasoningEffort, undefined);
   });
 
@@ -106,16 +119,27 @@ describe("GPT-5.6 Luna model catalog", () => {
     const models = publicModelsFromCatalog(normalizeModelCatalog(LUNA_CATALOG), 123);
     assert.deepEqual(models.map((model) => model.id), [
       "gpt-5.6-luna",
+      "gpt-5.6-luna-low",
       "gpt-5.6-luna-medium",
       "gpt-5.6-luna-high",
       "gpt-5.6-luna-xhigh",
       "gpt-5.6-luna-max",
+      "luna-low",
       "luna-medium",
       "luna-high",
       "luna-xhigh",
       "luna-max",
+      "luna-low-fast",
+      "luna-medium-fast",
+      "luna-high-fast",
+      "luna-xhigh-fast",
+      "luna-max-fast",
     ]);
     assert.equal(models.every((model) => model.created === 123), true);
+    assert.equal(
+      models.find((model) => model.id === "luna-xhigh-fast")?.default_reasoning_effort,
+      "xhigh",
+    );
   });
 
   it("keeps Cursor system and developer messages distinct in Responses input", () => {
@@ -172,14 +196,21 @@ describe("Cursor Luna HTTP compatibility", () => {
       const modelIds = ((await models.json()) as { data: { id: string }[] }).data.map((model) => model.id);
       assert.deepEqual(modelIds, [
         "gpt-5.6-luna",
+        "gpt-5.6-luna-low",
         "gpt-5.6-luna-medium",
         "gpt-5.6-luna-high",
         "gpt-5.6-luna-xhigh",
         "gpt-5.6-luna-max",
+        "luna-low",
         "luna-medium",
         "luna-high",
         "luna-xhigh",
         "luna-max",
+        "luna-low-fast",
+        "luna-medium-fast",
+        "luna-high-fast",
+        "luna-xhigh-fast",
+        "luna-max-fast",
       ]);
 
       const response = await fetch(`${baseUrl}/v1/chat/completions`, {
@@ -189,7 +220,7 @@ describe("Cursor Luna HTTP compatibility", () => {
           authorization: "Bearer luna-proxy-secret",
         },
         body: JSON.stringify({
-          model: "luna-xhigh",
+          model: "luna-xhigh-fast",
           messages: [
             { role: "system", content: "You are Cursor." },
             { role: "developer", content: "Preserve this developer instruction." },
@@ -200,11 +231,26 @@ describe("Cursor Luna HTTP compatibility", () => {
       assert.equal(response.status, 200);
       assert.equal(seenOptions.model, "gpt-5.6-luna");
       assert.deepEqual(seenOptions.reasoning, { effort: "xhigh" });
+      assert.equal(seenOptions.serviceTier, "fast");
       assert.deepEqual((seenMessages as { role: string; content: string }[]).map((message) => [message.role, message.content]), [
         ["system", "You are Cursor."],
         ["developer", "Preserve this developer instruction."],
         ["user", "Inspect the repository."],
       ]);
+
+      const conflicting = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer luna-proxy-secret",
+        },
+        body: JSON.stringify({
+          model: "luna-xhigh-fast",
+          service_tier: "default",
+          messages: [{ role: "user", content: "Reject this combination." }],
+        }),
+      });
+      assert.equal(conflicting.status, 400);
     });
   });
 

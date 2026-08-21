@@ -21,6 +21,7 @@ export interface ResolvedModel {
   requestedModel: string;
   upstreamModel: string;
   reasoningEffort?: string;
+  serviceTier?: string;
   catalogEntry?: ModelCatalogEntry;
   alias: boolean;
 }
@@ -28,6 +29,7 @@ export interface ResolvedModel {
 const MODEL_LIST_KEYS = ["models", "data"] as const;
 const LUNA_MODEL_SLUG = "gpt-5.6-luna";
 const LUNA_ALIAS_PREFIX = "luna-";
+const LUNA_FAST_SUFFIX = "-fast";
 
 export function isLunaModelId(model: string): boolean {
   return model === LUNA_MODEL_SLUG
@@ -124,6 +126,31 @@ export function resolveModelAlias(
     };
   }
 
+  const fastEffort = requestedModel.startsWith(LUNA_ALIAS_PREFIX)
+    && requestedModel.endsWith(LUNA_FAST_SUFFIX)
+    ? requestedModel.slice(
+      LUNA_ALIAS_PREFIX.length,
+      -LUNA_FAST_SUFFIX.length,
+    )
+    : "";
+  if (fastEffort) {
+    const luna = catalog.find((entry) => entry.slug === LUNA_MODEL_SLUG);
+    if (
+      luna != null
+      && luna.supportedReasoningLevels.some((level) => level.effort === fastEffort)
+      && supportsFastSpeed(luna)
+    ) {
+      return {
+        requestedModel,
+        upstreamModel: luna.slug,
+        reasoningEffort: fastEffort,
+        serviceTier: "fast",
+        catalogEntry: luna,
+        alias: true,
+      };
+    }
+  }
+
   if (requestedModel.startsWith(LUNA_ALIAS_PREFIX)) {
     const luna = catalog.find((entry) => entry.slug === LUNA_MODEL_SLUG);
     const effort = requestedModel.slice(LUNA_ALIAS_PREFIX.length);
@@ -157,7 +184,7 @@ export function publicModelsFromCatalog(
   for (const entry of catalog) {
     if (entry.supportedInApi === false) continue;
     const virtualAliases: string[] = [];
-    const add = (id: string, suffix?: string): void => {
+    const add = (id: string, suffix?: string, defaultReasoningEffort = suffix): void => {
       models.push({
         id,
         object: "model",
@@ -168,7 +195,7 @@ export function publicModelsFromCatalog(
           : `${entry.displayName} (${suffix})`,
         description: entry.description,
         context_window: entry.contextWindow ?? entry.maxContextWindow,
-        default_reasoning_effort: suffix ?? entry.defaultReasoningEffort,
+        default_reasoning_effort: defaultReasoningEffort ?? entry.defaultReasoningEffort,
       });
     };
     add(entry.slug);
@@ -181,8 +208,25 @@ export function publicModelsFromCatalog(
     for (const effort of virtualAliases) {
       add(`${LUNA_ALIAS_PREFIX}${effort}`, effort);
     }
+    if (entry.slug === LUNA_MODEL_SLUG && supportsFastSpeed(entry)) {
+      for (const effort of virtualAliases) {
+        add(`${LUNA_ALIAS_PREFIX}${effort}${LUNA_FAST_SUFFIX}`, `${effort}-fast`, effort);
+      }
+    }
   }
   return models;
+}
+
+function supportsFastSpeed(entry: ModelCatalogEntry): boolean {
+  const additionalSpeedTiers = entry.capabilities.additional_speed_tiers;
+  if (Array.isArray(additionalSpeedTiers) && additionalSpeedTiers.includes("fast")) {
+    return true;
+  }
+  const serviceTiers = entry.capabilities.service_tiers;
+  return Array.isArray(serviceTiers) && serviceTiers.some((tier) => {
+    if (typeof tier === "string") return tier === "fast" || tier === "priority";
+    return isRecord(tier) && (tier.id === "fast" || tier.id === "priority");
+  });
 }
 
 function normalizeReasoningLevels(value: unknown): ReasoningLevel[] {

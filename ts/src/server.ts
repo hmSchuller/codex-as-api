@@ -284,6 +284,16 @@ export function createApp(opts?: CreateAppOptions): express.Express {
             }
           }
         }
+        if (
+          selection.serviceTier != null
+          && body.service_tier != null
+          && body.service_tier !== "fast"
+          && body.service_tier !== "priority"
+        ) {
+          throw new ChatGPTOAuthInvalidRequestError(
+            "service tier conflicts with model alias",
+          );
+        }
 
         const subagent =
           body.subagent ||
@@ -305,8 +315,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           requestModel,
           selection.catalogEntry?.defaultReasoningEffort,
         );
+        const serviceTier = selection.serviceTier ?? body.service_tier;
         diagnosticLog(
-          `incoming model: ${clientModel} resolved model: ${requestModel} reasoning: ${reasoning?.effort ?? "none"}`,
+          `incoming model: ${clientModel} resolved model: ${requestModel} reasoning: ${reasoning?.effort ?? "none"} service tier: ${serviceTier ?? "default"}`,
         );
 
         const chatOpts = {
@@ -324,7 +335,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           subagent,
           memgenRequest,
           previousResponseId: body.previous_response_id,
-          serviceTier: body.service_tier,
+          serviceTier,
           text: resolveTextOptions(body.text, body.verbosity),
           clientMetadata: body.client_metadata,
           codexMetadata: body.codex_metadata,
