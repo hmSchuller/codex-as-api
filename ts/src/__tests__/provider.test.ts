@@ -85,6 +85,93 @@ function writeAuthFile(): string {
   return filePath;
 }
 
+class FakeWebSocket {
+  static plans: ("success" | "error")[] = [];
+  static responses: string[] = [];
+  static requests: Record<string, unknown>[] = [];
+  static instances: FakeWebSocket[] = [];
+  static inheritedMessageData = false;
+
+  readonly readyState = 1;
+  private readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+
+  constructor(
+    readonly url: string,
+    readonly options: { headers?: Record<string, string> },
+  ) {
+    FakeWebSocket.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: (event: unknown) => void): void {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: (event: unknown) => void): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  send(data: string): void {
+    const request = JSON.parse(data) as Record<string, unknown>;
+    FakeWebSocket.requests.push(request);
+    const plan = FakeWebSocket.plans.shift() ?? "success";
+    queueMicrotask(() => {
+      if (plan === "error") {
+        this.emit("error", { message: "fake WebSocket failure" });
+        return;
+      }
+      const text = FakeWebSocket.responses.shift() ?? "answer";
+      const item = {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      };
+      this.emitMessage({ type: "response.output_item.done", item });
+      this.emitMessage({
+        type: "response.completed",
+        response: {
+          id: `ws-response-${FakeWebSocket.requests.length}`,
+          output: [item],
+          usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+        },
+      });
+    });
+  }
+
+  close(): void {
+    this.emit("close", { message: "fake WebSocket closed" });
+  }
+
+  static reset(plans: ("success" | "error")[], responses: string[]): void {
+    FakeWebSocket.plans = [...plans];
+    FakeWebSocket.responses = [...responses];
+    FakeWebSocket.requests = [];
+    FakeWebSocket.instances = [];
+    FakeWebSocket.inheritedMessageData = false;
+  }
+
+  private emitMessage(event: Record<string, unknown>): void {
+    if (!FakeWebSocket.inheritedMessageData) {
+      this.emit("message", { data: JSON.stringify(event) });
+      return;
+    }
+    this.emit("message", new InheritedMessageEvent(JSON.stringify(event)));
+  }
+
+  private emit(type: string, event: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+class InheritedMessageEvent {
+  constructor(private readonly message: string) {}
+
+  get data(): string {
+    return this.message;
+  }
+}
+
 describe("ChatGPTOAuthProvider payload", () => {
   it("omits max_output_tokens even when maxTokens is set", () => {
     const provider = new ChatGPTOAuthProvider({});
@@ -1086,6 +1173,166 @@ describe("Responses stream completion", () => {
       collectResponseOutputItems(payload: Record<string, unknown>): Promise<Record<string, unknown>[]>;
     }).collectResponseOutputItems({});
     assert.deepEqual(output, []);
+  });
+});
+
+describe("cached WebSocket continuation", () => {
+  it("reads MessageEvent data inherited from the event prototype", async () => {
+    const authPath = writeAuthFile();
+    try {
+      FakeWebSocket.reset(["success"], ["inherited event"]);
+      FakeWebSocket.inheritedMessageData = true;
+      const provider = new ChatGPTOAuthProvider({
+        authJsonPath: authPath,
+        webSocket: FakeWebSocket as never,
+      });
+
+      const response = await provider.chat(providerMessages(), {
+        model: "gpt-5.5",
+        responsesLite: false,
+        sessionId: "session-inherited-event",
+      });
+
+      assert.equal(response.content, "inherited event");
+    } finally {
+      fs.rmSync(path.dirname(authPath), { recursive: true, force: true });
+    }
+  });
+
+  it("reuses a session continuation without sharing it across sessions", async () => {
+    const authPath = writeAuthFile();
+    try {
+      FakeWebSocket.reset(["success", "success", "success"], ["first", "second", "other"]);
+      const provider = new ChatGPTOAuthProvider({
+        authJsonPath: authPath,
+        webSocket: FakeWebSocket as never,
+      });
+      const first = [
+        { role: MessageRole.SYSTEM, content: "You are helpful." },
+        { role: MessageRole.USER, content: "Hello" },
+      ];
+      await provider.chat(first, { model: "gpt-5.5", responsesLite: false, sessionId: "session-a" });
+      await provider.chat([
+        ...first,
+        { role: MessageRole.ASSISTANT, content: "first" },
+        { role: MessageRole.USER, content: "Next" },
+      ], { model: "gpt-5.5", responsesLite: false, sessionId: "session-a" });
+      await provider.chat([
+        { role: MessageRole.SYSTEM, content: "You are helpful." },
+        { role: MessageRole.USER, content: "Other" },
+      ], { model: "gpt-5.5", responsesLite: false, sessionId: "session-b" });
+
+      assert.equal(FakeWebSocket.instances.length, 2, JSON.stringify(FakeWebSocket.requests));
+      assert.equal(FakeWebSocket.instances[0].options.headers?.["session-id"], "session-a");
+      assert.equal(FakeWebSocket.instances[0].options.headers?.["x-client-request-id"], "session-a");
+      assert.equal(Object.hasOwn(FakeWebSocket.requests[0], "previous_response_id"), false);
+      assert.equal(FakeWebSocket.requests[1].previous_response_id, "ws-response-1");
+      assert.deepEqual(FakeWebSocket.requests[1].input, [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Next" }],
+      }]);
+      assert.equal(Object.hasOwn(FakeWebSocket.requests[2], "previous_response_id"), false);
+    } finally {
+      fs.rmSync(path.dirname(authPath), { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to full input when the request history does not match", async () => {
+    const authPath = writeAuthFile();
+    try {
+      FakeWebSocket.reset(["success", "success"], ["first", "second"]);
+      const provider = new ChatGPTOAuthProvider({
+        authJsonPath: authPath,
+        webSocket: FakeWebSocket as never,
+      });
+      await provider.chat([
+        { role: MessageRole.SYSTEM, content: "You are helpful." },
+        { role: MessageRole.USER, content: "Hello" },
+      ], { model: "gpt-5.5", responsesLite: false, sessionId: "session-mismatch" });
+      await provider.chat([
+        { role: MessageRole.SYSTEM, content: "You are helpful." },
+        { role: MessageRole.USER, content: "Hello" },
+        { role: MessageRole.ASSISTANT, content: "not the upstream answer" },
+        { role: MessageRole.USER, content: "Next" },
+      ], { model: "gpt-5.5", responsesLite: false, sessionId: "session-mismatch" });
+
+      assert.equal(Object.hasOwn(FakeWebSocket.requests[1], "previous_response_id"), false);
+      assert.equal((FakeWebSocket.requests[1].input as unknown[]).length, 3);
+    } finally {
+      fs.rmSync(path.dirname(authPath), { recursive: true, force: true });
+    }
+  });
+
+  it("clears stale continuation on failure and keeps SSE fallback functional", async () => {
+    const authPath = writeAuthFile();
+    try {
+      FakeWebSocket.reset(["success", "error", "success"], ["first", "reconnected"]);
+      const provider = new ChatGPTOAuthProvider({
+        authJsonPath: authPath,
+        webSocket: FakeWebSocket as never,
+      });
+      let ssePayload: Record<string, unknown> | undefined;
+      (provider as unknown as {
+        postSSE(
+          path: string,
+          payload: Record<string, unknown>,
+          headers?: Record<string, string>,
+        ): AsyncGenerator<Record<string, unknown>>;
+      }).postSSE = async function* (_path, payload) {
+        ssePayload = payload;
+        yield {
+          type: "response.output_item.done",
+          item: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "sse answer" }],
+          },
+        };
+        yield {
+          type: "response.completed",
+          response: {
+            id: "sse-response",
+            output: [],
+            usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+          },
+        };
+      };
+
+      const first = [
+        { role: MessageRole.SYSTEM, content: "You are helpful." },
+        { role: MessageRole.USER, content: "Hello" },
+      ];
+      await provider.chat(first, {
+        model: "gpt-5.5",
+        responsesLite: false,
+        sessionId: "session-failure",
+      });
+      await provider.chat([
+        ...first,
+        { role: MessageRole.ASSISTANT, content: "first" },
+        { role: MessageRole.USER, content: "Fallback" },
+      ], {
+        model: "gpt-5.5",
+        responsesLite: false,
+        sessionId: "session-failure",
+      });
+      await provider.chat([
+        ...first,
+        { role: MessageRole.ASSISTANT, content: "sse answer" },
+        { role: MessageRole.USER, content: "Reconnect" },
+      ], {
+        model: "gpt-5.5",
+        responsesLite: false,
+        sessionId: "session-failure",
+      });
+
+      assert.equal(Object.hasOwn(ssePayload ?? {}, "previous_response_id"), false);
+      assert.equal(FakeWebSocket.instances.length, 2, JSON.stringify(FakeWebSocket.requests));
+      assert.equal(Object.hasOwn(FakeWebSocket.requests[2], "previous_response_id"), false);
+    } finally {
+      fs.rmSync(path.dirname(authPath), { recursive: true, force: true });
+    }
   });
 });
 

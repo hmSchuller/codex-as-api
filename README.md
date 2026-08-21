@@ -160,7 +160,7 @@ The list is dynamic. The proxy creates a reasoning alias only when the upstream 
 - Verify the request path with a model alias such as `gpt-5.6-luna-high` and check the diagnostic line for `resolved model: gpt-5.6-luna reasoning: high service tier: default`.
 - Function tools are forwarded to Luna and returned to Cursor as Chat Completions tool calls. Cursor executes them; this proxy never executes tools.
 
-The proxy supports Chat Completions streaming and local full-history continuation for repeated tool turns. The private Codex Responses Lite route requires `all_turns` reasoning context and does not support hosted tools that need a standalone executor; Cursor-owned function tools remain supported.
+The proxy supports Chat Completions streaming and local full-history continuation for repeated tool turns. For Cursor requests that provide a stable `user` value, it derives a privacy-safe conversation affinity from that value and the first user turn. Identified sessions use the private Responses WebSocket with `session-id` and `x-client-request-id`; matching subsequent full histories are reduced to `previous_response_id` plus the new input delta, while mismatches, reconnects, or unsupported WebSocket transport fall back to full-context SSE. The private Codex Responses Lite route requires `all_turns` reasoning context and does not support hosted tools that need a standalone executor; Cursor-owned function tools remain supported.
 
 ## Install & Run
 
@@ -260,6 +260,7 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_RESPONSES_LITE` | `auto` | Responses Lite mode: `auto`, `on`, or `off` |
 | `CODEX_AS_API_CODEX_METADATA` | `off` | Add Codex-style per-turn `client_metadata` and related backend headers |
 | `CODEX_AS_API_MODEL_CATALOG_TTL_MS` | `300000` | Cache duration for the authenticated Codex model catalog |
+| `CODEX_AS_API_PROMPT_CACHE_KEY` | derived from `PROXY_API_KEY` | Stable fallback cache-affinity key for Chat requests without an explicit key or session ID |
 | `CODEX_AS_API_LOG` | `info` | Set to `off` to disable diagnostic logs |
 | `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
 
@@ -523,9 +524,24 @@ These features are extensions beyond the standard OpenAI API, designed for Codex
 
 `prompt_cache_key` keeps related prefixes in the same backend cache family. Use one stable, privacy-safe key per conversation or application prefix.
 
-Official Codex 0.147.0 [defaults this field to its Responses metadata session ID](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/core/src/client.rs#L475-L487), and [projects the same value into `client_metadata.session_id`](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/core/src/responses_metadata.rs#L219-L228), unless an explicit override is present. This proxy follows the same precedence on Chat requests: explicit `prompt_cache_key`, then a non-empty `client_metadata.session_id`, then omission. It does not generate a process-wide session or reuse `thread_id` as the cache key.
+For Chat requests that do not provide either `prompt_cache_key` or
+`client_metadata.session_id`, the TypeScript server derives a stable fallback
+from `PROXY_API_KEY`. Set `CODEX_AS_API_PROMPT_CACHE_KEY` to use an explicit
+deployment or application namespace instead. Explicit request keys and session
+IDs still take precedence. The fallback is hashed before it is sent upstream;
+the proxy credential is never forwarded as a cache key.
+
+Official Codex 0.147.0 [defaults this field to its Responses metadata session ID](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/core/src/client.rs#L475-L487), and [projects the same value into `client_metadata.session_id`](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/core/src/responses_metadata.rs#L219-L228), unless an explicit override is present. This proxy follows the same precedence on Chat requests: explicit `prompt_cache_key`, then a non-empty `client_metadata.session_id`, then the configured stable fallback, and omission only when no fallback is configured. It does not generate a process-wide session or reuse `thread_id` as the cache key.
 
 The private Codex OAuth HTTP and WebSocket request structures do not contain public GPT-5.6 `prompt_cache_options` or content-block `prompt_cache_breakpoint` fields. This proxy treats explicit `null` as omitted and rejects non-null controls with HTTP 400 instead of forwarding a request that the private route rejects or silently pretending the requested cache policy was applied. Use a public Responses API client when explicit cache policy or breakpoints are required. See OpenAI's [public prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-breakpoints).
+
+Cursor's repeated `user` field identifies the Cursor account rather than a
+conversation. The TypeScript bridge combines it with the first user-turn
+history, hashes the result, and uses that hash as the session and cache
+affinity key. Explicit `client_metadata.session_id`, conversation/session
+headers, and `prompt_cache_key` take precedence. Requests without a reliable
+conversation seed retain the configured fallback key but do not share WebSocket
+continuation state.
 
 ```json
 {

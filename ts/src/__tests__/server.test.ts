@@ -29,19 +29,29 @@ function hasNestedKey(value: unknown, key: string): boolean {
 async function withServer(
   provider: ChatGPTOAuthProvider | Record<string, unknown>,
   fn: (baseUrl: string) => Promise<void>,
-  opts: { model?: string | null; codexConfig?: CodexConfig; authPath?: string } = {},
+  opts: {
+    model?: string | null;
+    codexConfig?: CodexConfig;
+    authPath?: string;
+    proxyApiKey?: string;
+    promptCacheKey?: string;
+  } = {},
 ): Promise<void> {
   const app = createApp(opts.model === null
     ? {
         provider: provider as never,
         codexConfig: opts.codexConfig ?? TEST_CONFIG,
         authPath: opts.authPath,
+        proxyApiKey: opts.proxyApiKey,
+        promptCacheKey: opts.promptCacheKey,
       }
     : {
         provider: provider as never,
         model: opts.model ?? "gpt-5.5",
         codexConfig: opts.codexConfig ?? TEST_CONFIG,
         authPath: opts.authPath,
+        proxyApiKey: opts.proxyApiKey,
+        promptCacheKey: opts.promptCacheKey,
       });
   const server = await new Promise<Server>((resolve) => {
     const listening = app.listen(0, "127.0.0.1", () => resolve(listening));
@@ -1008,6 +1018,114 @@ describe("Anthropic compatibility helper routes", () => {
       assert.equal(Object.hasOwn(opts, "clientMetadata"), false);
       assert.equal(Object.hasOwn(opts, "previousResponseId"), false);
     }
+  });
+
+  it("derives stable Chat cache affinity from the proxy key", async () => {
+    const options: Record<string, unknown>[] = [];
+    const provider = {
+      async chat(_messages: unknown, opts: Record<string, unknown>) {
+        options.push(opts);
+        return {
+          content: "done",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: null,
+          reasoning_content: null,
+        };
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const send = async (body: Record<string, unknown>): Promise<Response> => fetch(
+        `${baseUrl}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer proxy-secret",
+          },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            messages: [{ role: "user", content: "hello" }],
+            ...body,
+          }),
+        },
+      );
+
+      for (const response of [
+        await send({}),
+        await send({}),
+        await send({ prompt_cache_key: "explicit-cache-key" }),
+        await send({ client_metadata: { session_id: "session-cache" } }),
+      ]) {
+        assert.equal(response.status, 200);
+      }
+    }, { proxyApiKey: "proxy-secret" });
+
+    const fallback = crypto
+      .createHash("sha256")
+      .update("codex-as-api:proxy-cache:proxy-secret", "utf8")
+      .digest("hex");
+    assert.equal(options[0].promptCacheKey, fallback);
+    assert.equal(options[1].promptCacheKey, fallback);
+    assert.equal(options[2].promptCacheKey, "explicit-cache-key");
+    assert.equal(options[3].promptCacheKey, undefined);
+  });
+
+  it("maps Cursor user history to isolated per-conversation sessions", async () => {
+    const options: Record<string, unknown>[] = [];
+    const provider = {
+      async chat(_messages: unknown, opts: Record<string, unknown>) {
+        options.push(opts);
+        return {
+          content: "done",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: null,
+          reasoning_content: null,
+        };
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const send = async (messages: Record<string, unknown>[]): Promise<Response> => fetch(
+        `${baseUrl}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            user: "github|cursor-user",
+            messages,
+          }),
+        },
+      );
+      const first = [
+        { role: "system", content: "You are Cursor." },
+        { role: "user", content: "First conversation" },
+      ];
+      const sameConversation = [
+        ...first,
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Continue" },
+      ];
+      const differentConversation = [
+        { role: "system", content: "You are Cursor." },
+        { role: "user", content: "Different conversation" },
+      ];
+      for (const response of [
+        await send(first),
+        await send(sameConversation),
+        await send(differentConversation),
+      ]) {
+        assert.equal(response.status, 200);
+      }
+    });
+
+    assert.equal(options[0].sessionId, options[1].sessionId);
+    assert.notEqual(options[0].sessionId, options[2].sessionId);
+    assert.equal(options[0].promptCacheKey, options[1].promptCacheKey);
+    assert.notEqual(options[0].promptCacheKey, options[2].promptCacheKey);
   });
 
   it("rejects malformed Claude cache controls before provider transport", async () => {

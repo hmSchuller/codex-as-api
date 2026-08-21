@@ -34,8 +34,8 @@ For configuration, supported endpoints, model behavior, and examples, see the [c
 |---|---|---|
 | `client_metadata.session_id` | Forwarded, used as default cache affinity, and required by Codex metadata mode | Not used |
 | `client_metadata.thread_id` | Codex metadata identity; root defaults to the session and an explicit child thread is preserved | Not used or synthesized |
-| `prompt_cache_key` | Explicit value, then non-empty session ID, then omission | Explicit proxy extension, then hashed Claude Code session header |
-| `previous_response_id` | 256-chain process-local full-history replay; never forwarded | Non-null values return HTTP 400 |
+| `prompt_cache_key` | Explicit value, then non-empty session ID, then configured fallback or omission | Explicit proxy extension, then hashed Claude Code session header |
+| `previous_response_id` | Caller-supplied IDs use 256-chain process-local full-history replay; identified Cursor sessions use WebSocket continuation with full-context fallback | Non-null values return HTTP 400 |
 | `cache_control` | Not a Chat control | Validated as an Anthropic hint and stripped before Codex |
 
 Claude Code's exact `x-claude-code-session-id` value is hashed as
@@ -43,6 +43,15 @@ Claude Code's exact `x-claude-code-session-id` value is hashed as
 only. It is not converted to Codex session or thread metadata. Accepted
 Anthropic cache hints use `type: "ephemeral"` with optional TTL `5m` or `1h`;
 the private Codex transport cannot apply Anthropic breakpoint or TTL semantics.
+For Chat requests with no explicit key or `client_metadata.session_id`, the
+server uses a stable hash derived from `PROXY_API_KEY`. Set
+`CODEX_AS_API_PROMPT_CACHE_KEY` to choose a separate deployment namespace.
+Cursor requests with a repeated `user` value are additionally mapped to a
+hashed session derived from that account value and the first user-turn history.
+That mapping is per conversation, not a process-wide Cursor-user key. Matching
+turns reuse a cached private Responses WebSocket and send only the new input
+with `previous_response_id`; mismatches and transport failures clear the stale
+continuation and use full-context SSE.
 This behavior was rechecked against Codex `0.147.0` at
 `be6e8eac029b183056b7e4402879f15d2c85f61b`; Claude Code compatibility was
 last checked with `2.1.220`.

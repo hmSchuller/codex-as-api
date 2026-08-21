@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import * as os from "node:os";
+import WebSocket from "ws";
 import packageMetadata from "../package.json";
 import upstreamContract from "../../config/codex-upstream-contract.json";
 import {
@@ -70,6 +71,37 @@ interface ResponseChain {
   input: Record<string, unknown>[];
   output: Record<string, unknown>[];
 }
+
+interface WebSocketLike {
+  readonly readyState?: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(type: "open" | "message" | "error" | "close", listener: (event: unknown) => void): void;
+  removeEventListener(type: "open" | "message" | "error" | "close", listener: (event: unknown) => void): void;
+}
+
+type WebSocketConstructor = new (
+  url: string,
+  options?: { headers?: Record<string, string> },
+) => WebSocketLike;
+
+interface WebSocketContinuation {
+  request: Record<string, unknown>;
+  responseId: string;
+  responseItems: Record<string, unknown>[];
+}
+
+interface CachedWebSocket {
+  socket: WebSocketLike;
+  busy: boolean;
+  createdAt: number;
+  continuation?: WebSocketContinuation;
+  idleTimer?: ReturnType<typeof setTimeout>;
+}
+
+const WEBSOCKET_BETA = "responses_websockets=2026-02-06";
+const WEBSOCKET_IDLE_TTL = 5 * 60 * 1000;
+const WEBSOCKET_MAX_AGE = 55 * 60 * 1000;
 
 class ResponseChainStore {
   private readonly chains = new Map<string, ResponseChain>();
@@ -191,6 +223,7 @@ export interface ChatOptions {
   maxTokens?: number;
   stop?: string | string[];
   promptCacheKey?: string;
+  sessionId?: string;
   promptCacheOptions?: PromptCacheOptions;
   safetyIdentifier?: string;
   subagent?: string;
@@ -235,6 +268,8 @@ export class ChatGPTOAuthProvider {
   private authJsonPath: string | undefined;
   private timeout: number | undefined;
   private readonly responseChains = new ResponseChainStore();
+  private readonly websocketSessions = new Map<string, CachedWebSocket>();
+  private readonly webSocketConstructor: WebSocketConstructor;
   private readonly semanticInputs = new WeakMap<
     Record<string, unknown>,
     Record<string, unknown>[]
@@ -246,6 +281,7 @@ export class ChatGPTOAuthProvider {
       baseUrl?: string;
       authJsonPath?: string;
       timeout?: number;
+      webSocket?: WebSocketConstructor;
     } = {},
   ) {
     this.model = opts.model || CHATGPT_OAUTH_DEFAULT_MODEL;
@@ -254,6 +290,8 @@ export class ChatGPTOAuthProvider {
     ).replace(/\/+$/, "");
     this.authJsonPath = opts.authJsonPath;
     this.timeout = opts.timeout;
+    this.webSocketConstructor = opts.webSocket
+      ?? (WebSocket as unknown as WebSocketConstructor);
   }
 
   async chat(
@@ -350,13 +388,47 @@ export class ChatGPTOAuthProvider {
         ? "true"
         : "false";
     }
+    if (opts.sessionId != null) {
+      extraHeaders["session-id"] = opts.sessionId;
+      extraHeaders["x-client-request-id"] = opts.sessionId;
+    }
 
-    return this.streamChatPayload(payload, extraHeaders);
+    return this.streamChatPayload(payload, extraHeaders, opts.sessionId);
   }
 
   private async *streamChatPayload(
     payload: Record<string, unknown>,
     extraHeaders: Record<string, string>,
+    sessionId?: string,
+  ): AsyncGenerator<StreamEvent> {
+    if (sessionId != null) {
+      let emitted = false;
+      try {
+        for await (const event of this.processChatEvents(
+          this.postWebSocket(payload, extraHeaders, sessionId),
+          payload,
+        )) {
+          emitted = true;
+          yield event;
+        }
+        return;
+      } catch (err) {
+        // SSE is safe only before any assistant event has been exposed. The
+        // WebSocket continuation is cleared by the transport on every error.
+        if (emitted) throw err;
+        traceProtocol("WebSocket transport fallback", String(err));
+      }
+    }
+
+    yield* this.processChatEvents(
+      this.postSSE("/responses", payload, extraHeaders),
+      payload,
+    );
+  }
+
+  private async *processChatEvents(
+    events: AsyncIterable<Record<string, unknown>>,
+    payload: Record<string, unknown>,
   ): AsyncGenerator<StreamEvent> {
     const semanticInput = this.semanticInputs.get(payload);
     if (semanticInput == null) {
@@ -374,11 +446,7 @@ export class ChatGPTOAuthProvider {
     let sawReasoningDelta = false;
     let sawToolCall = false;
 
-    for await (const event of this.postSSE(
-      "/responses",
-      payload,
-      extraHeaders,
-    )) {
+    for await (const event of events) {
       const typ = event.type;
       traceProtocol("provider event", event);
 
@@ -848,6 +916,8 @@ export class ChatGPTOAuthProvider {
       const sessionId = sessionIdFromClientMetadata(clientMetadata);
       if (sessionId != null) {
         payload.prompt_cache_key = sessionId;
+      } else if (opts.sessionId != null) {
+        payload.prompt_cache_key = opts.sessionId;
       }
     }
     setReasoningPayload(
@@ -1154,6 +1224,400 @@ export class ChatGPTOAuthProvider {
       return;
     }
   }
+
+  private async *postWebSocket(
+    payload: Record<string, unknown>,
+    extraHeaders: Record<string, string>,
+    sessionId: string,
+  ): AsyncGenerator<Record<string, unknown>> {
+    const token = await tokenForRequest(this.authJsonPath);
+    const headers = this.getHeaders(token);
+    delete headers.Accept;
+    delete headers["Content-Type"];
+    headers["OpenAI-Beta"] = WEBSOCKET_BETA;
+    Object.assign(headers, extraHeaders);
+    headers["session-id"] = sessionId;
+    headers["x-client-request-id"] = sessionId;
+
+    const accountKey = `${token.account_id}:${sessionId}`;
+    let entry: CachedWebSocket | undefined;
+    let keepConnection = false;
+    try {
+      entry = await this.acquireWebSocket(accountKey, headers, sessionId);
+      const request = buildWebSocketRequest(entry, payload);
+      traceProtocol("upstream WebSocket request", {
+        method: "POST",
+        url: webSocketUrl(this.baseUrl + "/responses"),
+        headers: traceHeaders(headers),
+        body: request,
+      });
+      entry.socket.send(JSON.stringify({ type: "response.create", ...request }));
+
+      let responseId: string | undefined;
+      let responseItems: Record<string, unknown>[] = [];
+      let completed = false;
+      for await (const rawEvent of readWebSocketEvents(entry.socket)) {
+        const event = rawEvent.type === "response.done"
+          ? { ...rawEvent, type: "response.completed" }
+          : rawEvent;
+        if (event.type === "response.output_item.done" && isRecord(event.item)) {
+          responseItems.push(event.item);
+        }
+        if (event.type === "response.completed") {
+          const response = isRecord(event.response) ? event.response : undefined;
+          if (typeof response?.id === "string" && response.id.length > 0) {
+            responseId = response.id;
+          }
+          if (Array.isArray(response?.output) && response.output.length > 0) {
+            responseItems = response.output.filter(isRecord);
+          }
+          completed = true;
+          if (responseId != null) {
+            entry.continuation = {
+              request: cloneResponsePayload(payload),
+              responseId,
+              responseItems: responseHistoryItems(responseItems),
+            };
+            // The response processor returns immediately after yielding the
+            // completion event, so commit before yielding that event.
+            keepConnection = true;
+          }
+        }
+        yield event;
+        if (completed) break;
+      }
+      if (!completed || responseId == null) {
+        throw new ChatGPTOAuthError(
+          "ChatGPT OAuth WebSocket response ended before response.completed",
+        );
+      }
+    } catch (err) {
+      if (entry) {
+        entry.continuation = undefined;
+        this.removeWebSocket(accountKey, entry);
+      }
+      throw err instanceof ChatGPTOAuthError
+        ? err
+        : new ChatGPTOAuthError(`ChatGPT OAuth WebSocket request failed: ${String(err)}`);
+    } finally {
+      if (entry) {
+        if (!keepConnection) entry.continuation = undefined;
+        entry.busy = false;
+        if (!keepConnection) {
+          closeWebSocket(entry.socket);
+          this.removeWebSocket(accountKey, entry);
+        } else {
+          scheduleWebSocketExpiry(this.websocketSessions, accountKey, entry);
+        }
+      }
+    }
+  }
+
+  private async acquireWebSocket(
+    accountKey: string,
+    headers: Record<string, string>,
+    sessionId: string,
+  ): Promise<CachedWebSocket> {
+    const cached = this.websocketSessions.get(accountKey);
+    if (cached) {
+      if (cached.idleTimer) {
+        clearTimeout(cached.idleTimer);
+        cached.idleTimer = undefined;
+      }
+      if (cached.busy) {
+        throw new ChatGPTOAuthError(
+          `WebSocket session ${JSON.stringify(sessionId)} is already handling a request`,
+        );
+      }
+      if (
+        Date.now() - cached.createdAt < WEBSOCKET_MAX_AGE
+        && isWebSocketReusable(cached.socket)
+      ) {
+        cached.busy = true;
+        return cached;
+      }
+      closeWebSocket(cached.socket);
+      this.removeWebSocket(accountKey, cached);
+    }
+
+    const socket = await connectWebSocket(
+      webSocketUrl(this.baseUrl + "/responses"),
+      headers,
+      this.timeout === 0 ? 0 : this.timeout ?? 15_000,
+      this.webSocketConstructor,
+    );
+    const entry: CachedWebSocket = {
+      socket,
+      busy: true,
+      createdAt: Date.now(),
+    };
+    this.websocketSessions.set(accountKey, entry);
+    return entry;
+  }
+
+  private removeWebSocket(accountKey: string, entry: CachedWebSocket): void {
+    if (this.websocketSessions.get(accountKey) !== entry) return;
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    this.websocketSessions.delete(accountKey);
+  }
+}
+
+function cloneResponsePayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+}
+
+function buildWebSocketRequest(
+  entry: CachedWebSocket,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const continuation = entry.continuation;
+  if (continuation == null) return payload;
+
+  if (
+    !requestBodiesMatchExceptInput(payload, continuation.request)
+    || !Array.isArray(payload.input)
+    || !Array.isArray(continuation.request.input)
+  ) {
+    entry.continuation = undefined;
+    return payload;
+  }
+
+  const baseline = [
+    ...continuation.request.input,
+    ...continuation.responseItems,
+  ];
+  if (
+    payload.input.length < baseline.length
+    || !responseInputsEqual(payload.input.slice(0, baseline.length), baseline)
+  ) {
+    entry.continuation = undefined;
+    return payload;
+  }
+
+  return {
+    ...payload,
+    previous_response_id: continuation.responseId,
+    input: payload.input.slice(baseline.length),
+  };
+}
+
+function requestBodiesMatchExceptInput(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): boolean {
+  const withoutInput = (value: Record<string, unknown>) => {
+    const { input: _input, previous_response_id: _previous, ...rest } = value;
+    return rest;
+  };
+  return JSON.stringify(withoutInput(left)) === JSON.stringify(withoutInput(right));
+}
+
+function responseInputsEqual(
+  left: Record<string, unknown>[],
+  right: Record<string, unknown>[],
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function responseHistoryItems(
+  items: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const history: Record<string, unknown>[] = [];
+  for (const item of items) {
+    if (item.type === "message" && item.role === "assistant") {
+      history.push(messageItem("assistant", textFromResponseItems([item])));
+      continue;
+    }
+    if (item.type === "function_call" || item.type === "custom_tool_call") {
+      history.push({
+        type: "function_call",
+        call_id: item.call_id ?? item.id ?? "function-call",
+        name: item.name ?? "",
+        arguments: typeof item.arguments === "string"
+          ? item.arguments
+          : JSON.stringify(item.arguments ?? item.input ?? {}),
+      });
+    }
+  }
+  return history;
+}
+
+function webSocketUrl(url: string): string {
+  const parsed = new URL(url);
+  parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+  return parsed.toString();
+}
+
+async function connectWebSocket(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+  constructor: WebSocketConstructor,
+): Promise<WebSocketLike> {
+  return new Promise<WebSocketLike>((resolve, reject) => {
+    let socket: WebSocketLike;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      socket = new constructor(url, { headers });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("error", onError);
+      socket.removeEventListener("close", onClose);
+    };
+    const fail = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    const onOpen = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(socket);
+    };
+    const onError = (event: unknown) => fail(webSocketError(event, "WebSocket connection failed"));
+    const onClose = (event: unknown) => fail(webSocketError(event, "WebSocket connection closed"));
+
+    socket.addEventListener("open", onOpen);
+    socket.addEventListener("error", onError);
+    socket.addEventListener("close", onClose);
+    if (socket.readyState === 1) {
+      onOpen();
+    } else if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        closeWebSocket(socket);
+        fail(new Error(`WebSocket connect timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+      timer.unref?.();
+    }
+  });
+}
+
+async function* readWebSocketEvents(
+  socket: WebSocketLike,
+): AsyncGenerator<Record<string, unknown>> {
+  const queue: Record<string, unknown>[] = [];
+  let wake: (() => void) | undefined;
+  let closed = false;
+  let completed = false;
+  let failure: Error | undefined;
+
+  const notify = () => {
+    const resolve = wake;
+    wake = undefined;
+    resolve?.();
+  };
+  const onMessage = (event: unknown) => {
+    try {
+      const text = webSocketMessageText(event);
+      if (text == null) return;
+      const parsed = JSON.parse(text);
+      if (!isRecord(parsed)) throw new Error("WebSocket event must be an object");
+      queue.push(parsed);
+      if (parsed.type === "response.completed" || parsed.type === "response.done") {
+        completed = true;
+        closed = true;
+      }
+    } catch (err) {
+      failure = err instanceof Error ? err : new Error(String(err));
+      closed = true;
+    }
+    notify();
+  };
+  const onError = (event: unknown) => {
+    failure = webSocketError(event, "WebSocket stream failed");
+    closed = true;
+    notify();
+  };
+  const onClose = (event: unknown) => {
+    if (!completed && failure == null) {
+      failure = webSocketError(event, "WebSocket stream closed before response.completed");
+    }
+    closed = true;
+    notify();
+  };
+
+  socket.addEventListener("message", onMessage);
+  socket.addEventListener("error", onError);
+  socket.addEventListener("close", onClose);
+  try {
+    while (!closed || queue.length > 0) {
+      if (queue.length === 0) {
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+        continue;
+      }
+      yield queue.shift()!;
+    }
+    if (failure) throw failure;
+    if (!completed) {
+      throw new Error("WebSocket stream ended before response.completed");
+    }
+  } finally {
+    socket.removeEventListener("message", onMessage);
+    socket.removeEventListener("error", onError);
+    socket.removeEventListener("close", onClose);
+  }
+}
+
+function webSocketMessageText(event: unknown): string | null {
+  const data = isRecord(event) && "data" in event
+    ? event.data
+    : event;
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) {
+    return new TextDecoder().decode(
+      new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+    );
+  }
+  return null;
+}
+
+function webSocketError(event: unknown, fallback: string): Error {
+  if (isRecord(event) && typeof event.message === "string" && event.message) {
+    return new Error(event.message);
+  }
+  if (event instanceof Error) return event;
+  return new Error(fallback);
+}
+
+function isWebSocketReusable(socket: WebSocketLike): boolean {
+  return socket.readyState == null || socket.readyState === 1;
+}
+
+function closeWebSocket(socket: WebSocketLike): void {
+  try {
+    socket.close(1000, "done");
+  } catch {
+    // The socket may already have been closed by the upstream.
+  }
+}
+
+function scheduleWebSocketExpiry(
+  sessions: Map<string, CachedWebSocket>,
+  key: string,
+  entry: CachedWebSocket,
+): void {
+  if (entry.idleTimer) clearTimeout(entry.idleTimer);
+  entry.idleTimer = setTimeout(() => {
+    if (entry.busy) return;
+    closeWebSocket(entry.socket);
+    if (sessions.get(key) === entry) sessions.delete(key);
+  }, WEBSOCKET_IDLE_TTL);
+  entry.idleTimer.unref?.();
 }
 
 function normalizeClientMetadata(

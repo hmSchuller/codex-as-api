@@ -132,6 +132,7 @@ export interface CreateAppOptions {
   model?: string;
   authPath?: string;
   proxyApiKey?: string;
+  promptCacheKey?: string;
 }
 
 interface ModelCatalogProvider {
@@ -194,6 +195,10 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     bundledCatalog(),
   );
   const proxyApiKey = opts?.proxyApiKey ?? process.env.PROXY_API_KEY?.trim();
+  const defaultPromptCacheKey = resolveDefaultPromptCacheKey(
+    opts?.promptCacheKey ?? process.env.CODEX_AS_API_PROMPT_CACHE_KEY,
+    proxyApiKey,
+  );
 
   const app = express();
   app.use(express.json({ limit: "50mb" }));
@@ -265,6 +270,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         const messages = requestMessagesToInternal(
           body.messages || [],
         );
+        const sessionId = resolveChatSessionId(req, body, messages);
         const tools = parseTools(body.tools);
         const stop = normalizeStop(body.stop);
         const maxTokens =
@@ -329,7 +335,12 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           reasoning,
           maxTokens,
           stop,
-          promptCacheKey: body.prompt_cache_key,
+          promptCacheKey: resolveChatPromptCacheKey(
+            body,
+            defaultPromptCacheKey,
+            sessionId,
+          ),
+          sessionId,
           promptCacheOptions: body.prompt_cache_options,
           safetyIdentifier: body.safety_identifier,
           subagent,
@@ -979,6 +990,88 @@ function resolvePromptCacheKey(value: unknown): string | undefined {
     );
   }
   return value;
+}
+
+function resolveDefaultPromptCacheKey(
+  configuredKey: string | undefined,
+  proxyApiKey: string | undefined,
+): string | undefined {
+  const trimmedConfiguredKey = configuredKey?.trim();
+  if (trimmedConfiguredKey) return trimmedConfiguredKey;
+  if (!proxyApiKey) return undefined;
+  return crypto
+    .createHash("sha256")
+    .update(`codex-as-api:proxy-cache:${proxyApiKey}`, "utf8")
+    .digest("hex");
+}
+
+function resolveChatPromptCacheKey(
+  body: Record<string, unknown>,
+  defaultPromptCacheKey: string | undefined,
+  sessionId?: string,
+): string | undefined {
+  const explicit = resolvePromptCacheKey(body.prompt_cache_key);
+  if (explicit != null) return explicit;
+  if (hasSessionCacheIdentity(body.client_metadata)) return undefined;
+  if (sessionId != null) return sessionId;
+  return defaultPromptCacheKey;
+}
+
+function resolveChatSessionId(
+  req: Request,
+  body: Record<string, unknown>,
+  messages: Message[],
+): string | undefined {
+  const metadataSession = isRecord(body.client_metadata)
+    && typeof body.client_metadata.session_id === "string"
+    ? body.client_metadata.session_id
+    : undefined;
+  const explicit = firstNonEmptyString([
+    metadataSession,
+    body.session_id,
+    body.conversation_id,
+    req.headers["x-cursor-session-id"],
+    req.headers["x-cursor-conversation-id"],
+    req.headers["conversation-id"],
+    req.headers["session-id"],
+  ]);
+  if (explicit != null) {
+    return chatSessionHash("explicit", explicit);
+  }
+
+  const firstUserIndex = messages.findIndex(
+    (message) => message.role === MessageRole.USER,
+  );
+  const cursorUser = typeof body.user === "string" ? body.user.trim() : "";
+  if (firstUserIndex < 0 || cursorUser.length === 0) return undefined;
+  const seed = JSON.stringify({
+    user: cursorUser,
+    history: messages.slice(0, firstUserIndex + 1),
+  });
+  return chatSessionHash("cursor-history", seed);
+}
+
+function firstNonEmptyString(values: unknown[]): string | undefined {
+  for (const value of values) {
+    const candidate = Array.isArray(value) ? value[0] : value;
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function chatSessionHash(namespace: string, value: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(`codex-as-api:chat-session:${namespace}:${value}`, "utf8")
+    .digest("hex");
+}
+
+function hasSessionCacheIdentity(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.session_id === "string"
+    && value.session_id.trim().length > 0;
 }
 
 function resolvePreviousResponseId(value: unknown): string | undefined {
