@@ -102,12 +102,10 @@ function handleError(err: unknown, res: Response): void {
 
 function writeOpenAIStreamError(err: unknown, res: Response): void {
   if (res.writableEnded) return;
-  res.write(
-    `data: ${JSON.stringify({
-      error: { message: String(err), type: errorType(err) },
-    })}\n\n`,
-  );
-  res.write("data: [DONE]\n\n");
+  writeOpenAIStreamData(res, {
+    error: { message: String(err), type: errorType(err) },
+  });
+  writeOpenAIStreamData(res, "[DONE]");
   res.end();
 }
 
@@ -117,7 +115,9 @@ function handleAnthropicError(err: unknown, res: Response): void {
 
   if (res.headersSent) {
     if (!res.writableEnded) {
-      res.write(`event: error\ndata: ${JSON.stringify(body)}\n\n`);
+      const chunk = `event: error\ndata: ${JSON.stringify(body)}\n\n`;
+      traceProtocol("outgoing Anthropic SSE error", chunk);
+      res.write(chunk);
       res.end();
     }
     return;
@@ -198,6 +198,17 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   const app = express();
   app.use(express.json({ limit: "50mb" }));
   app.use("/v1", proxyAuthentication(proxyApiKey));
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    if (req.method !== "GET" && req.body !== undefined) {
+      traceProtocol("incoming request", {
+        method: req.method,
+        path: req.originalUrl,
+        headers: traceHeaders(req.headers),
+        body: req.body,
+      });
+    }
+    next();
+  });
 
   async function resolveRequestModel(requestedModel: string): Promise<ReturnType<typeof resolveModelAlias>> {
     // Luna visibility and aliases are account-sensitive. Legacy secondary
@@ -347,7 +358,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
               },
             ],
           };
-          res.write(`data: ${JSON.stringify(preamble)}\n\n`);
+          writeOpenAIStreamData(res, preamble);
 
           let usageDict: Record<string, unknown> | null = null;
           let upstreamResponseId: string | null = null;
@@ -370,7 +381,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              writeOpenAIStreamData(res, chunk);
             } else if (typ === "reasoning_delta") {
               const chunk = {
                 id: requestId,
@@ -385,7 +396,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              writeOpenAIStreamData(res, chunk);
             } else if (typ === "reasoning_raw_delta") {
               const chunk = {
                 id: requestId,
@@ -400,7 +411,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              writeOpenAIStreamData(res, chunk);
             } else if (typ === "tool_call_start") {
               const toolCallId = String(event.id ?? "");
               if (typeof event.name === "string" && event.name) toolCallNames.add(event.name);
@@ -431,7 +442,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              writeOpenAIStreamData(res, chunk);
             } else if (typ === "tool_call_delta") {
               const toolCallId = String(event.id ?? "");
               let toolCallIndex = toolCallIndices.get(toolCallId);
@@ -462,7 +473,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              writeOpenAIStreamData(res, chunk);
             } else if (typ === "tool_call") {
               const toolCallId = String(event.id ?? "");
               if (typeof event.name === "string" && event.name) toolCallNames.add(event.name);
@@ -493,7 +504,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              writeOpenAIStreamData(res, chunk);
             } else if (typ === "finish") {
               upstreamResponseId = typeof event.response_id === "string"
                 ? event.response_id
@@ -522,7 +533,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                 ],
                 response_id: upstreamResponseId,
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              writeOpenAIStreamData(res, chunk);
               diagnosticLog(
                 `upstream status: 200 response ID: ${upstreamResponseId ?? "none"} tool calls: ${[...toolCallNames].join(", ") || "none"}`,
               );
@@ -550,12 +561,10 @@ export function createApp(opts?: CreateAppOptions): express.Express {
                 },
               },
             };
-            res.write(
-              `data: ${JSON.stringify(finishChunk)}\n\n`,
-            );
+            writeOpenAIStreamData(res, finishChunk);
           }
 
-          res.write("data: [DONE]\n\n");
+          writeOpenAIStreamData(res, "[DONE]");
           res.end();
         } else {
           const response = await provider.chat(
@@ -618,9 +627,15 @@ export function createApp(opts?: CreateAppOptions): express.Express {
             `upstream status: 200 response ID: ${response.response_id ?? "none"} tool calls: ${response.tool_calls.map((call) => call.name).join(", ") || "none"}`,
           );
 
+          traceProtocol("outgoing OpenAI JSON", result);
           res.json(result);
         }
       } catch (err) {
+        traceProtocol("OpenAI route error", {
+          path: req.originalUrl,
+          error: String(err),
+          headersSent: res.headersSent,
+        });
         if (res.headersSent) {
           writeOpenAIStreamError(err, res);
         } else {
@@ -886,14 +901,22 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           clientModel,
           requestId,
         )) {
+          traceProtocol("outgoing Anthropic SSE", chunk);
           res.write(chunk);
         }
         res.end();
       } else {
         const response = await provider.chat(messages, chatOpts);
-        res.json(internalResponseToAnthropic(response, clientModel, requestId));
+        const result = internalResponseToAnthropic(response, clientModel, requestId);
+        traceProtocol("outgoing Anthropic JSON", result);
+        res.json(result);
       }
     } catch (err) {
+      traceProtocol("Anthropic route error", {
+        path: req.originalUrl,
+        error: String(err),
+        headersSent: res.headersSent,
+      });
       handleAnthropicError(err, res);
     }
   });
@@ -1774,6 +1797,40 @@ function diagnosticLog(message: string): void {
   const level = (process.env.CODEX_AS_API_LOG ?? "info").trim().toLowerCase();
   if (level === "off" || level === "silent" || level === "none") return;
   console.info(`[codex-as-api] ${message}`);
+}
+
+function writeOpenAIStreamData(res: Response, data: unknown): void {
+  traceProtocol("outgoing OpenAI SSE", data);
+  const serialized = typeof data === "string" ? data : JSON.stringify(data);
+  res.write(`data: ${serialized}\n\n`);
+}
+
+function traceLoggingEnabled(): boolean {
+  return (process.env.CODEX_AS_API_LOG ?? "info").trim().toLowerCase() === "trace";
+}
+
+function traceProtocol(label: string, value: unknown): void {
+  if (!traceLoggingEnabled()) return;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value) ?? String(value);
+  } catch {
+    serialized = String(value);
+  }
+  console.info(`[codex-as-api] trace ${label} ${serialized}`);
+}
+
+function traceHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): Record<string, string | string[] | undefined> {
+  return Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [
+      name,
+      /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key)$/i.test(name)
+        ? "[redacted]"
+        : value,
+    ]),
+  );
 }
 
 function debugModelRequest(req: Request, body: unknown): void {

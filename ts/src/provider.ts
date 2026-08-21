@@ -369,6 +369,7 @@ export class ChatGPTOAuthProvider {
     const yieldedWebSearchIds = new Set<string>();
     const startedToolCallIds = new Set<string>();
     const toolCallIdsWithDeltas = new Set<string>();
+    const responseItemCallIds = new Map<string, string>();
     let sawTextDelta = false;
     let sawReasoningDelta = false;
     let sawToolCall = false;
@@ -379,6 +380,7 @@ export class ChatGPTOAuthProvider {
       extraHeaders,
     )) {
       const typ = event.type;
+      traceProtocol("provider event", event);
 
       if (typ === "response.output_text.delta") {
         const delta = event.delta;
@@ -391,6 +393,9 @@ export class ChatGPTOAuthProvider {
         if (isRecord(item) && (item.type === "function_call" || item.type === "custom_tool_call")) {
           const tool = toolCallFromResponseItem(item);
           if (tool) {
+            if (typeof item.id === "string" && item.id) {
+              responseItemCallIds.set(item.id, tool.id);
+            }
             sawToolCall = true;
             startedToolCallIds.add(tool.id);
             yield { type: "tool_call_start", id: tool.id, name: tool.name, arguments: "" };
@@ -411,7 +416,8 @@ export class ChatGPTOAuthProvider {
         || typ === "response.custom_tool_call_input.delta"
       ) {
         const delta = event.delta ?? event.input;
-        const id = String(event.call_id ?? event.item_id ?? event.id ?? "");
+        const rawId = String(event.call_id ?? event.item_id ?? event.id ?? "");
+        const id = responseItemCallIds.get(rawId) ?? rawId;
         if (typeof delta === "string" && delta && id) {
           if (!startedToolCallIds.has(id)) {
             startedToolCallIds.add(id);
@@ -436,11 +442,16 @@ export class ChatGPTOAuthProvider {
         const itemDict = item as Record<string, unknown>;
         finalOutput.push(itemDict);
         const tool = toolCallFromResponseItem(itemDict);
-        if (tool && !toolCallIdsWithDeltas.has(tool.id)) {
+        const toolId = tool == null
+          ? null
+          : typeof itemDict.id === "string"
+            ? responseItemCallIds.get(itemDict.id) ?? tool.id
+            : tool.id;
+        if (tool && toolId != null && !toolCallIdsWithDeltas.has(toolId)) {
           sawToolCall = true;
           yield {
             type: "tool_call",
-            id: tool.id,
+            id: toolId,
             name: tool.name,
             arguments: tool.arguments,
           };
@@ -914,6 +925,13 @@ export class ChatGPTOAuthProvider {
       ];
 
       const url = this.baseUrl + path;
+      traceProtocol("upstream request", {
+        attempt: attempt + 1,
+        method: "POST",
+        url,
+        headers: traceHeaders(headers),
+        body: payload,
+      });
       let response: Response;
       try {
         response = await fetch(url, {
@@ -925,13 +943,19 @@ export class ChatGPTOAuthProvider {
             : undefined,
         });
       } catch (err) {
+        traceProtocol("upstream request error", String(err));
         throw new ChatGPTOAuthError(
           `ChatGPT OAuth request failed: ${redactText(String(err), ...tokenValues)}`,
         );
       }
+      traceProtocol("upstream response", {
+        status: response.status,
+        headers: traceHeaders(Object.fromEntries(response.headers.entries())),
+      });
 
       if (!response.ok) {
         const body = await response.text();
+        traceProtocol("upstream response body", redactText(body, ...tokenValues));
         const redacted = redactText(body, ...tokenValues);
         if (response.status === 401 && attempt === 0) {
           await refreshAfterUnauthorized(token);
@@ -943,6 +967,9 @@ export class ChatGPTOAuthProvider {
         );
       }
 
+      if (traceLoggingEnabled()) {
+        traceProtocol("upstream response body", await response.clone().text());
+      }
       const data = await response.json();
       if (
         typeof data !== "object" ||
@@ -970,6 +997,12 @@ export class ChatGPTOAuthProvider {
         token.id_token,
         token.account_id,
       ];
+      traceProtocol("upstream request", {
+        attempt: attempt + 1,
+        method: "GET",
+        url: this.baseUrl + path,
+        headers: traceHeaders(headers),
+      });
       let response: Response;
       try {
         response = await fetch(this.baseUrl + path, {
@@ -980,12 +1013,18 @@ export class ChatGPTOAuthProvider {
             : undefined,
         });
       } catch (err) {
+        traceProtocol("upstream request error", String(err));
         throw new ChatGPTOAuthError(
           `ChatGPT OAuth request failed: ${redactText(String(err), ...tokenValues)}`,
         );
       }
+      traceProtocol("upstream response", {
+        status: response.status,
+        headers: traceHeaders(Object.fromEntries(response.headers.entries())),
+      });
       if (!response.ok) {
         const body = redactText(await response.text(), ...tokenValues);
+        traceProtocol("upstream response body", body);
         if (response.status === 401 && attempt === 0) {
           await refreshAfterUnauthorized(token);
           continue;
@@ -994,6 +1033,9 @@ export class ChatGPTOAuthProvider {
           response.status,
           `ChatGPT OAuth request failed: HTTP ${response.status}: ${body}`,
         );
+      }
+      if (traceLoggingEnabled()) {
+        traceProtocol("upstream response body", await response.clone().text());
       }
       const data = await response.json();
       if (typeof data !== "object" || data === null || Array.isArray(data)) {
@@ -1026,6 +1068,13 @@ export class ChatGPTOAuthProvider {
       ];
 
       const url = this.baseUrl + path;
+      traceProtocol("upstream request", {
+        attempt: attempt + 1,
+        method: "POST",
+        url,
+        headers: traceHeaders(headers),
+        body: payload,
+      });
       let response: globalThis.Response;
       try {
         response = await fetch(url, {
@@ -1037,13 +1086,19 @@ export class ChatGPTOAuthProvider {
             : undefined,
         });
       } catch (err) {
+        traceProtocol("upstream request error", String(err));
         throw new ChatGPTOAuthError(
           `ChatGPT OAuth request failed: ${redactText(String(err), ...tokenValues)}`,
         );
       }
+      traceProtocol("upstream response", {
+        status: response.status,
+        headers: traceHeaders(Object.fromEntries(response.headers.entries())),
+      });
 
       if (!response.ok) {
         const body = await response.text();
+        traceProtocol("upstream response body", redactText(body, ...tokenValues));
         const redacted = redactText(body, ...tokenValues);
         if (response.status === 401 && attempt === 0) {
           await refreshAfterUnauthorized(token);
@@ -1065,19 +1120,25 @@ export class ChatGPTOAuthProvider {
           const { done, value } = await reader.read();
           if (done) {
             if (block.length) {
+              traceProtocol("upstream SSE block", block.join("\n"));
               const event = decodeSSEBlock(block);
+              if (event) traceProtocol("upstream SSE event", event);
               if (event) yield event;
             }
             return;
           }
-          buffer += decoder.decode(value, { stream: true });
+          const decodedChunk = decoder.decode(value, { stream: true });
+          traceProtocol("upstream SSE chunk", decodedChunk);
+          buffer += decodedChunk;
           const lines = buffer.split("\n");
           buffer = lines.pop()!;
           for (const rawLine of lines) {
             const line = rawLine.replace(/\r$/, "");
             if (line === "") {
+              traceProtocol("upstream SSE block", block.join("\n"));
               const event = decodeSSEBlock(block);
               block.length = 0;
+              if (event) traceProtocol("upstream SSE event", event);
               if (event) yield event;
               continue;
             }
@@ -1159,6 +1220,34 @@ export function decodeSSEBlock(
     throw new ChatGPTOAuthError("ChatGPT OAuth SSE event must be a JSON object");
   }
   return event;
+}
+
+function traceLoggingEnabled(): boolean {
+  return (process.env.CODEX_AS_API_LOG ?? "info").trim().toLowerCase() === "trace";
+}
+
+function traceProtocol(label: string, value: unknown): void {
+  if (!traceLoggingEnabled()) return;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value) ?? String(value);
+  } catch {
+    serialized = String(value);
+  }
+  console.info(`[codex-as-api] trace ${label} ${serialized}`);
+}
+
+function traceHeaders(
+  headers: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [
+      name,
+      /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key)$/i.test(name)
+        ? "[redacted]"
+        : value,
+    ]),
+  );
 }
 
 export function splitInstructionsAndInput(

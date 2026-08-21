@@ -149,7 +149,7 @@ The list is dynamic. The proxy creates a reasoning alias only when the upstream 
 - If the tunnel exits unexpectedly, check that the named tunnel token is current and that its hostname ingress points to `http://127.0.0.1:8787`.
 - If the public health check fails, verify that `PUBLIC_URL` is the Cloudflare hostname without `/v1`; Cursor receives the normalized `/v1` URL.
 - If Luna is absent from `GET /v1/models`, the authenticated account did not expose Luna in the Codex catalog. The proxy fails Luna requests clearly instead of silently switching to Sol.
-- Set `CODEX_AS_API_LOG=info` to log the incoming model, resolved upstream model, reasoning effort, upstream status, response ID, and tool names. Set it to `debug` to inspect model-related request fields and headers. Prompts and credentials are not logged.
+- Set `CODEX_AS_API_LOG=info` to log the incoming model, resolved upstream model, reasoning effort, upstream status, response ID, and tool names. Set it to `debug` to inspect model-related request fields and headers. Set it to `trace` to print full incoming request bodies, normalized upstream payloads, raw upstream SSE chunks/events, and outgoing SSE/JSON responses; authorization-style headers are redacted, but prompts, tool schemas, arguments, and tool results are included. Use trace only for local debugging.
 - Verify the request path with a model alias such as `gpt-5.6-luna-high` and check the diagnostic line for `resolved model: gpt-5.6-luna reasoning: high`.
 - Function tools are forwarded to Luna and returned to Cursor as Chat Completions tool calls. Cursor executes them; this proxy never executes tools.
 

@@ -262,13 +262,20 @@ describe("Responses function-call event translation", () => {
     }).postSSE = async function* () {
       yield {
         type: "response.output_item.added",
-        item: { type: "function_call", call_id: "call-1", name: "grep", arguments: "" },
+        item: {
+          id: "item-1",
+          type: "function_call",
+          call_id: "call-1",
+          name: "grep",
+          arguments: "",
+        },
       };
-      yield { type: "response.function_call_arguments.delta", item_id: "call-1", delta: '{"q":"' };
-      yield { type: "response.function_call_arguments.delta", item_id: "call-1", delta: 'Luna"}' };
+      yield { type: "response.function_call_arguments.delta", item_id: "item-1", delta: '{"q":"' };
+      yield { type: "response.function_call_arguments.delta", item_id: "item-1", delta: 'Luna"}' };
       yield {
         type: "response.output_item.done",
         item: {
+          id: "item-1",
           type: "function_call",
           call_id: "call-1",
           name: "grep",
@@ -290,6 +297,9 @@ describe("Responses function-call event translation", () => {
       "tool_call_delta",
       "finish",
     ]);
+    assert.deepEqual(events
+      .filter((event) => event.id != null)
+      .map((event) => event.id), ["call-1", "call-1", "call-1"]);
     assert.equal(events[1].id, "call-1");
     assert.equal(events[2].arguments, 'Luna"}');
   });
